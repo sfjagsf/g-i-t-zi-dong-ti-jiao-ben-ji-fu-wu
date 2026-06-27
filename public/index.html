@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GFlow // GitHub Codex-Style GitTool</title>
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- Main Stylesheet -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Ambient background glow elements -->
+  <div class="glow-bg">
+    <div class="glow-1"></div>
+    <div class="glow-2"></div>
+  </div>
+
+  <div class="app-container">
+    <!-- Header / Top Bar -->
+    <header class="top-bar glass">
+      <div class="brand">
+        <i data-lucide="git-branch" class="brand-icon"></i>
+        <span class="brand-text">GFLOW<span class="subtext">//CODEX</span></span>
+      </div>
+
+      <div class="path-selector-container">
+        <div class="path-input-wrapper">
+          <i data-lucide="folder" class="icon-muted"></i>
+          <!-- Recent paths dropdown -->
+          <select id="recent-paths-select" class="select-path-custom">
+            <option value="">最近链接的目录...</option>
+          </select>
+          <input type="text" id="project-path" placeholder="或在此输入绝对路径..." />
+          <button id="btn-load-path" class="btn btn-primary-outline btn-sm">链接目录</button>
+        </div>
+      </div>
+
+      <div class="auth-status-container">
+        <div id="auth-info" class="auth-info clickable" onclick="toggleAuthModal()">
+          <span class="status-dot offline" id="auth-status-dot"></span>
+          <span class="auth-username" id="auth-username-display">未连接 GitHub</span>
+          <img id="auth-avatar" class="avatar-img hidden" src="" alt="Avatar" />
+          <i data-lucide="settings" class="icon-sm"></i>
+        </div>
+      </div>
+    </header>
+
+    <div class="main-layout">
+      <!-- Left Panel: GitHub Repositories Dropdown & Branch List -->
+      <section class="panel panel-left glass">
+        <div class="panel-header">
+          <div class="panel-title-group">
+            <i data-lucide="git-pull-request"></i>
+            <h2>远程仓库项目</h2>
+          </div>
+          <div class="panel-actions">
+            <button id="btn-open-create-repo" class="btn btn-primary-outline btn-xs" title="新建 GitHub 仓库">
+              <i data-lucide="plus"></i> 新建仓库
+            </button>
+            <button id="btn-refresh-repos" class="btn-icon-link" title="刷新仓库列表">
+              <i data-lucide="rotate-cw" class="icon-xs"></i>
+            </button>
+          </div>
+        </div>
+        
+        <div class="panel-content scrollbar-custom" id="repos-panel-content">
+          <!-- Dropdown Repo Selector -->
+          <div class="repo-selector-row">
+            <select id="repo-select" class="select-custom">
+              <option value="">请选择 GitHub 仓库...</option>
+            </select>
+            <button id="btn-delete-active-repo" class="btn btn-danger btn-sm hidden" title="彻底删除当前选中的 GitHub 仓库">
+              <i data-lucide="trash-2" class="icon-sm"></i>
+            </button>
+          </div>
+
+          <!-- Branch List Section -->
+          <div class="branches-list-section">
+            <div class="section-title branch-header-row">
+              <h3>分支列表</h3>
+              <!-- Inline branch creation form inside branch list -->
+              <div class="branch-create-inline">
+                <input type="text" id="new-branch-input" placeholder="新分支名称..." />
+                <button id="btn-create-branch" class="btn btn-secondary btn-xs" title="基于本地当前位置创建并推送分支">
+                  <i data-lucide="plus" class="icon-xs"></i>
+                </button>
+              </div>
+            </div>
+            <div class="branch-list-wrapper scrollbar-custom" id="branches-list">
+              <div class="empty-state-text">请在上方选择一个 GitHub 仓库</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Middle Panel: File Changes & Commits -->
+      <section class="panel panel-middle glass">
+        <div class="panel-header">
+          <i data-lucide="file-code"></i>
+          <h2>工作区待提交更改</h2>
+        </div>
+        
+        <div class="panel-content vertical-layout">
+          <!-- Active Repo Info Ribbon -->
+          <div class="active-repo-ribbon hidden" id="active-repo-ribbon">
+            <div class="ribbon-text">
+              <span class="label">物理目录:</span>
+              <span class="value" id="ribbon-path">-</span>
+            </div>
+            <div class="ribbon-text">
+              <span class="label">远程仓库:</span>
+              <span class="value" id="ribbon-repo">-</span>
+            </div>
+            <div class="ribbon-text">
+              <span class="label">当前分支:</span>
+              <div class="ribbon-branch-group">
+                <span class="value branch-badge" id="ribbon-branch">-</span>
+                <button id="btn-ribbon-create-branch" class="btn btn-primary-outline btn-xs" title="基于当前位置创建新分支">
+                  <i data-lucide="plus" class="icon-xs"></i> 新建分支
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- File changes list -->
+          <div class="changes-list-wrapper scrollbar-custom">
+            <div class="section-title changes-header-row">
+              <div class="changes-title-left">
+                <h3>本地改动状态</h3>
+                <span id="changes-count-badge" class="count-badge">0</span>
+              </div>
+              <!-- Manual refresh local changes button -->
+              <button id="btn-refresh-changes" class="btn-icon-link" title="刷新本地改动">
+                <i data-lucide="rotate-cw" class="icon-xs"></i> 刷新改动
+              </button>
+            </div>
+            <div class="file-changes-list" id="file-changes-list">
+              <div class="empty-state-text">无未提交的更改，本地工作区干净</div>
+            </div>
+          </div>
+
+          <!-- Commit Form -->
+          <div class="commit-form-wrapper">
+            <div class="form-group">
+              <label for="commit-desc-input">提交描述 <span class="required">*</span></label>
+              <textarea id="commit-desc-input" rows="3" placeholder="请输入本次提交的详细描述..."></textarea>
+            </div>
+            <button id="btn-commit-push" class="btn btn-accent btn-full btn-lg glow-btn-effect">
+              <i data-lucide="upload-cloud"></i> 立即提交并强制推送 (Force Push)
+            </button>
+            <div class="info-alert">
+              <i data-lucide="info" class="icon-sm"></i>
+              <span>本地不保存历史分支，强制覆盖远程分支。</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Panel: Commit History -->
+      <section class="panel panel-right glass">
+        <div class="panel-header">
+          <i data-lucide="history"></i>
+          <h2>历史提交记录</h2>
+        </div>
+        
+        <div class="panel-content scrollbar-custom" id="history-content">
+          <div class="empty-state-text">请在左侧选择仓库和分支以查看提交历史</div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Bottom Panel: Git Console -->
+    <footer class="console-panel glass">
+      <div class="console-header">
+        <div class="console-title">
+          <i data-lucide="terminal"></i>
+          <span>GIT 执行控制台</span>
+        </div>
+        <div class="console-actions">
+          <button id="btn-clear-logs" class="btn btn-primary-outline btn-xs">
+            <i data-lucide="trash-2"></i> 清空
+          </button>
+        </div>
+      </div>
+      <div class="console-output scrollbar-custom" id="console-output-box">
+        <div class="console-line system">// 欢迎使用 GFlow. 拖入项目目录以开始。</div>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Drag and drop overlay -->
+  <div id="drag-overlay" class="drag-overlay hidden">
+    <div class="drag-box">
+      <i data-lucide="folder-down"></i>
+      <p>释放鼠标将文件夹链接至 GFlow</p>
+    </div>
+  </div>
+
+  <!-- Settings / Token Auth Modal -->
+  <div id="auth-modal" class="modal-overlay hidden">
+    <div class="modal-card glass">
+      <div class="modal-header">
+        <h3>GitHub 账户凭证配置</h3>
+        <button class="btn-close" onclick="toggleAuthModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc">
+          请提供 GitHub Personal Access Token (PAT)，用于拉取仓库和管理远程。我们只在本地保存此凭证。
+        </p>
+        <div class="form-group">
+          <label for="token-input">GitHub Access Token (PAT)</label>
+          <input type="password" id="token-input" placeholder="ghp_xxxxxxxxxxxxxxxxxxxx" />
+        </div>
+        <div class="token-help">
+          <a href="https://github.com/settings/tokens" target="_blank" rel="noopener noreferrer">
+            <i data-lucide="external-link"></i> 去 GitHub 生成 Token (需要具有 repo 及 delete_repo 权限)
+          </a>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-primary-outline" onclick="toggleAuthModal()">取消</button>
+        <button id="btn-save-token" class="btn btn-accent">保存凭证</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Repository Modal -->
+  <div id="create-repo-modal" class="modal-overlay hidden">
+    <div class="modal-card glass">
+      <div class="modal-header">
+        <h3>新建 GitHub 远程仓库</h3>
+        <button class="btn-close" id="btn-close-create-repo">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="new-repo-name">仓库名称 <span class="required">*</span></label>
+          <input type="text" id="new-repo-name" placeholder="例如: 我的新仓库" />
+        </div>
+        <div class="form-group-checkbox">
+          <input type="checkbox" id="new-repo-private" checked />
+          <label for="new-repo-private">设为私有仓库 (Private)</label>
+        </div>
+        <div class="form-group-checkbox">
+          <input type="checkbox" id="new-repo-init" checked />
+          <label for="new-repo-init">初始化仓库 (自动创建 main 分支，包含默认空提交)</label>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-primary-outline" id="btn-cancel-create-repo">取消</button>
+        <button id="btn-confirm-create-repo" class="btn btn-accent">确认创建</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Custom Alert/Confirm Modal for Git Switching & Resets -->
+  <div id="dialog-modal" class="modal-overlay hidden">
+    <div class="modal-card dialog-card glass">
+      <div class="modal-header">
+        <h3 id="dialog-title">警告</h3>
+      </div>
+      <div class="modal-body">
+        <p id="dialog-message"></p>
+      </div>
+      <div class="modal-footer" id="dialog-footer">
+        <button id="dialog-btn-cancel" class="btn btn-primary-outline">取消</button>
+        <button id="dialog-btn-confirm" class="btn btn-danger">确认</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main Application Logic -->
+  <script src="app.js"></script>
+</body>
+</html>
