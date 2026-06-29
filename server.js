@@ -63,6 +63,44 @@ function maskToken(str, token) {
   return masked;
 }
 
+function resolveExistingDirectory(dirPath) {
+  if (typeof dirPath !== 'string' || !dirPath.trim()) return null;
+  const absolute = path.resolve(dirPath.trim());
+  try {
+    return fs.existsSync(absolute) && fs.lstatSync(absolute).isDirectory() ? absolute : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function isSafeRelativePathspec(filePath) {
+  if (typeof filePath !== 'string' || !filePath.trim() || filePath.includes('\0')) return false;
+  if (path.isAbsolute(filePath)) return false;
+  return !filePath.split(/[\\/]+/).includes('..');
+}
+
+async function validateBranchName(cwd, branch, token = '') {
+  if (typeof branch !== 'string' || !branch.trim() || branch !== branch.trim() || branch.startsWith('-')) {
+    return { success: false, error: 'Invalid branch name.' };
+  }
+  const result = await runCommand(cwd, ['check-ref-format', '--branch', branch], token);
+  if (!result.success) {
+    return { success: false, error: `Invalid branch name: ${branch}` };
+  }
+  return { success: true };
+}
+
+async function validateCommitRef(cwd, ref, token = '') {
+  if (typeof ref !== 'string' || !ref.trim() || ref !== ref.trim() || ref.startsWith('-')) {
+    return { success: false, error: 'Invalid commit reference.' };
+  }
+  const result = await runCommand(cwd, ['cat-file', '-e', `${ref}^{commit}`], token);
+  if (!result.success) {
+    return { success: false, error: `Commit reference was not found: ${ref}` };
+  }
+  return { success: true };
+}
+
 // Helper to run shell commands in cwd safely
 function runCommand(cwd, args, token = '') {
   return new Promise((resolve) => {
@@ -214,12 +252,13 @@ app.post('/api/git-logs/clear', (req, res) => {
 // Verify git installation & Check if directory is git repo
 app.post('/api/repo/status', async (req, res) => {
   const { dirPath } = req.body;
-  if (!dirPath || !fs.existsSync(dirPath)) {
+  const safeDir = resolveExistingDirectory(dirPath);
+  if (!safeDir) {
     return res.status(400).json({ success: false, error: 'Directory does not exist.' });
   }
 
   // Check if .git folder exists
-  const gitDir = path.join(dirPath, '.git');
+  const gitDir = path.join(safeDir, '.git');
   const isRepo = fs.existsSync(gitDir) && fs.lstatSync(gitDir).isDirectory();
 
   if (!isRepo) {
@@ -230,21 +269,21 @@ app.post('/api/repo/status', async (req, res) => {
   const config = loadConfig();
   const token = config.githubToken || '';
   
-  const remoteResult = await runCommand(dirPath, ['remote', 'get-url', 'origin'], token);
+  const remoteResult = await runCommand(safeDir, ['remote', 'get-url', 'origin'], token);
   let remoteUrl = '';
   if (remoteResult.success) {
     remoteUrl = remoteResult.stdout;
   }
 
   // Get current branch
-  const branchResult = await runCommand(dirPath, ['branch', '--show-current'], token);
+  const branchResult = await runCommand(safeDir, ['branch', '--show-current'], token);
   let currentBranch = '';
   if (branchResult.success) {
     currentBranch = branchResult.stdout;
   }
 
   // Check status of changes
-  const statusResult = await runCommand(dirPath, ['status', '--porcelain'], token);
+  const statusResult = await runCommand(safeDir, ['status', '--porcelain'], token);
   const hasChanges = statusResult.success && statusResult.stdout.length > 0;
   const changesList = statusResult.success ? statusResult.stdout.split('\n').filter(Boolean) : [];
 
@@ -261,7 +300,8 @@ app.post('/api/repo/status', async (req, res) => {
 // Initialize Git Repository & Link remote
 app.post('/api/repo/init', async (req, res) => {
   const { dirPath, remoteUrl } = req.body;
-  if (!dirPath || !fs.existsSync(dirPath)) {
+  const safeDir = resolveExistingDirectory(dirPath);
+  if (!safeDir) {
     return res.status(400).json({ success: false, error: 'Directory does not exist.' });
   }
 
@@ -287,30 +327,30 @@ app.post('/api/repo/init', async (req, res) => {
     authRemoteUrl = cleanRemoteUrl.replace(/https:\/\/github\.com\//, `https://oauth2:${token}@github.com/`);
   }
 
-  const gitDir = path.join(dirPath, '.git');
+  const gitDir = path.join(safeDir, '.git');
   const isRepo = fs.existsSync(gitDir);
 
   if (!isRepo) {
-    const initRes = await runCommand(dirPath, ['init'], token);
+    const initRes = await runCommand(safeDir, ['init'], token);
     if (!initRes.success) {
       return res.json({ success: false, error: 'Failed to init Git repo: ' + initRes.error });
     }
   }
 
-  const checkRemote = await runCommand(dirPath, ['remote'], token);
+  const checkRemote = await runCommand(safeDir, ['remote'], token);
   let setRemoteRes;
   if (checkRemote.stdout.includes('origin')) {
-    setRemoteRes = await runCommand(dirPath, ['remote', 'set-url', 'origin', authRemoteUrl], token);
+    setRemoteRes = await runCommand(safeDir, ['remote', 'set-url', 'origin', authRemoteUrl], token);
   } else {
-    setRemoteRes = await runCommand(dirPath, ['remote', 'add', 'origin', authRemoteUrl], token);
+    setRemoteRes = await runCommand(safeDir, ['remote', 'add', 'origin', authRemoteUrl], token);
   }
 
   if (!setRemoteRes.success) {
     return res.json({ success: false, error: 'Failed to configure remote: ' + setRemoteRes.error });
   }
 
-  await runCommand(dirPath, ['config', 'user.name', 'GitHub Auto Tool'], token);
-  await runCommand(dirPath, ['config', 'user.email', 'autotool@github.com'], token);
+  await runCommand(safeDir, ['config', 'user.name', 'GitHub Auto Tool'], token);
+  await runCommand(safeDir, ['config', 'user.email', 'autotool@github.com'], token);
 
   res.json({ success: true });
 });
@@ -351,17 +391,22 @@ app.post('/api/repo/branches', async (req, res) => {
 // Fetch commit history of a branch with --graph
 app.post('/api/repo/history', async (req, res) => {
   const { dirPath, branch } = req.body;
-  if (!dirPath || !fs.existsSync(dirPath)) {
+  const safeDir = resolveExistingDirectory(dirPath);
+  if (!safeDir) {
     return res.status(400).json({ success: false, error: 'Directory does not exist.' });
   }
 
   const config = loadConfig();
   const token = config.githubToken || '';
+  const branchValidation = await validateBranchName(safeDir, branch, token);
+  if (!branchValidation.success) {
+    return res.status(400).json({ success: false, error: branchValidation.error });
+  }
 
-  await runCommand(dirPath, ['fetch', 'origin', branch], token);
+  await runCommand(safeDir, ['fetch', 'origin', branch], token);
 
   const logRes = await runCommand(
-    dirPath,
+    safeDir,
     ['log', `origin/${branch}`, '--graph', '--pretty=format:%h|%an|%ar|%s', '-n', '50'],
     token
   );
@@ -390,7 +435,8 @@ app.post('/api/repo/history', async (req, res) => {
 // Commit and Force Push
 app.post('/api/repo/commit', async (req, res) => {
   const { dirPath, branch, description } = req.body;
-  if (!dirPath || !fs.existsSync(dirPath)) {
+  const safeDir = resolveExistingDirectory(dirPath);
+  if (!safeDir) {
     return res.status(400).json({ success: false, error: 'Directory does not exist.' });
   }
 
@@ -404,22 +450,27 @@ app.post('/api/repo/commit', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Commit description is required.' });
   }
 
-  const checkBranch = await runCommand(dirPath, ['checkout', '-B', branch], token);
-  if (!checkBranch.success) {
-    await runCommand(dirPath, ['checkout', branch], token);
+  const branchValidation = await validateBranchName(safeDir, branch, token);
+  if (!branchValidation.success) {
+    return res.status(400).json({ success: false, error: branchValidation.error });
   }
 
-  const addRes = await runCommand(dirPath, ['add', '-A'], token);
+  const checkBranch = await runCommand(safeDir, ['checkout', '-B', branch], token);
+  if (!checkBranch.success) {
+    await runCommand(safeDir, ['checkout', branch], token);
+  }
+
+  const addRes = await runCommand(safeDir, ['add', '-A'], token);
   if (!addRes.success) {
     return res.json({ success: false, error: 'Failed to stage changes: ' + addRes.error });
   }
 
-  const commitRes = await runCommand(dirPath, ['commit', '-m', description], token);
+  const commitRes = await runCommand(safeDir, ['commit', '-m', description], token);
   if (!commitRes.success && !commitRes.stdout.includes('nothing to commit')) {
     return res.json({ success: false, error: 'Failed to commit: ' + commitRes.error });
   }
 
-  const pushRes = await runCommand(dirPath, ['push', '-f', 'origin', branch], token);
+  const pushRes = await runCommand(safeDir, ['push', '--force-with-lease', 'origin', branch], token);
   if (!pushRes.success) {
     return res.json({ success: false, error: 'Failed to push: ' + pushRes.error });
   }
@@ -430,14 +481,19 @@ app.post('/api/repo/commit', async (req, res) => {
 // Switch branch
 app.post('/api/repo/switch', async (req, res) => {
   const { dirPath, branch, force } = req.body;
-  if (!dirPath || !fs.existsSync(dirPath)) {
+  const safeDir = resolveExistingDirectory(dirPath);
+  if (!safeDir) {
     return res.status(400).json({ success: false, error: 'Directory does not exist.' });
   }
 
   const config = loadConfig();
   const token = config.githubToken || '';
+  const branchValidation = await validateBranchName(safeDir, branch, token);
+  if (!branchValidation.success) {
+    return res.status(400).json({ success: false, error: branchValidation.error });
+  }
 
-  const statusRes = await runCommand(dirPath, ['status', '--porcelain'], token);
+  const statusRes = await runCommand(safeDir, ['status', '--porcelain'], token);
   const hasChanges = statusRes.success && statusRes.stdout.length > 0;
 
   if (hasChanges && !force) {
@@ -449,20 +505,24 @@ app.post('/api/repo/switch', async (req, res) => {
   }
 
   if (force && hasChanges) {
-    const hasHeadRes = await runCommand(dirPath, ['rev-parse', '--verify', 'HEAD'], token);
-    if (hasHeadRes.success) {
-      await runCommand(dirPath, ['reset', '--hard', 'HEAD'], token);
-    } else {
-      await runCommand(dirPath, ['rm', '-rf', '--cached', '.'], token);
+    const hasHeadRes = await runCommand(safeDir, ['rev-parse', '--verify', 'HEAD'], token);
+    if (!hasHeadRes.success) {
+      return res.json({
+        success: false,
+        error: 'Cannot safely switch branches in an empty repository with uncommitted changes.'
+      });
     }
-    await runCommand(dirPath, ['clean', '-df'], token);
+    const stashRes = await runCommand(safeDir, ['stash', 'push', '-u', '-m', `GFlow backup before switching to ${branch}`], token);
+    if (!stashRes.success) {
+      return res.json({ success: false, error: 'Failed to back up local changes before switching: ' + stashRes.error });
+    }
   }
 
-  await runCommand(dirPath, ['fetch', 'origin', branch], token);
+  await runCommand(safeDir, ['fetch', 'origin', branch], token);
 
-  const checkoutRes = await runCommand(dirPath, ['checkout', '-B', branch, `origin/${branch}`], token);
+  const checkoutRes = await runCommand(safeDir, ['checkout', '-B', branch, `origin/${branch}`], token);
   if (!checkoutRes.success) {
-    const checkoutLocalRes = await runCommand(dirPath, ['checkout', '-B', branch], token);
+    const checkoutLocalRes = await runCommand(safeDir, ['checkout', '-B', branch], token);
     if (!checkoutLocalRes.success) {
       return res.json({ success: false, error: 'Failed to switch branch: ' + checkoutRes.error });
     }
@@ -474,7 +534,8 @@ app.post('/api/repo/switch', async (req, res) => {
 // Create branch
 app.post('/api/repo/create-branch', async (req, res) => {
   const { dirPath, newBranchName, fromHash } = req.body;
-  if (!dirPath || !fs.existsSync(dirPath)) {
+  const safeDir = resolveExistingDirectory(dirPath);
+  if (!safeDir) {
     return res.status(400).json({ success: false, error: 'Directory does not exist.' });
   }
 
@@ -485,17 +546,28 @@ app.post('/api/repo/create-branch', async (req, res) => {
     return res.status(400).json({ success: false, error: 'New branch name is required.' });
   }
 
+  const branchValidation = await validateBranchName(safeDir, newBranchName, token);
+  if (!branchValidation.success) {
+    return res.status(400).json({ success: false, error: branchValidation.error });
+  }
+
   // Check if HEAD exists (i.e. has commits)
-  const revParseRes = await runCommand(dirPath, ['rev-parse', 'HEAD'], token);
+  const revParseRes = await runCommand(safeDir, ['rev-parse', 'HEAD'], token);
   const hasCommits = revParseRes.success;
 
   if (hasCommits) {
+    if (fromHash) {
+      const commitValidation = await validateCommitRef(safeDir, fromHash, token);
+      if (!commitValidation.success) {
+        return res.status(400).json({ success: false, error: commitValidation.error });
+      }
+    }
     const checkoutArgs = fromHash 
       ? ['checkout', '-b', newBranchName, fromHash] 
       : ['checkout', '-b', newBranchName];
 
     // 1. Checkout new branch locally
-    const checkoutRes = await runCommand(dirPath, checkoutArgs, token);
+    const checkoutRes = await runCommand(safeDir, checkoutArgs, token);
     if (!checkoutRes.success) {
       return res.json({ success: false, error: 'Failed to create branch locally: ' + checkoutRes.error });
     }
@@ -505,20 +577,20 @@ app.post('/api/repo/create-branch', async (req, res) => {
       return res.json({ success: false, error: 'Cannot create branch from a commit hash in an empty repository.' });
     }
     // Rename current orphan branch reference to the new branch name
-    const symRefRes = await runCommand(dirPath, ['symbolic-ref', 'HEAD', `refs/heads/${newBranchName}`], token);
+    const symRefRes = await runCommand(safeDir, ['symbolic-ref', 'HEAD', `refs/heads/${newBranchName}`], token);
     if (!symRefRes.success) {
       return res.json({ success: false, error: 'Failed to set branch name in empty repo: ' + symRefRes.error });
     }
   }
 
   // 2. Stage all modifications
-  await runCommand(dirPath, ['add', '-A'], token);
+  await runCommand(safeDir, ['add', '-A'], token);
 
   // 3. Commit staged changes (allowing empty commit so it never errors)
-  await runCommand(dirPath, ['commit', '--allow-empty', '-m', `Initial commit on branch ${newBranchName}`], token);
+  await runCommand(safeDir, ['commit', '--allow-empty', '-m', `Initial commit on branch ${newBranchName}`], token);
 
   // 4. Push branch to remote
-  const pushRes = await runCommand(dirPath, ['push', '-u', 'origin', newBranchName], token);
+  const pushRes = await runCommand(safeDir, ['push', '-u', 'origin', newBranchName], token);
   if (!pushRes.success) {
     return res.json({ success: false, error: 'Failed to push branch to remote: ' + pushRes.error });
   }
@@ -529,7 +601,8 @@ app.post('/api/repo/create-branch', async (req, res) => {
 // Delete remote branch
 app.post('/api/repo/delete-branch', async (req, res) => {
   const { dirPath, branchToDelete } = req.body;
-  if (!dirPath || !fs.existsSync(dirPath)) {
+  const safeDir = resolveExistingDirectory(dirPath);
+  if (!safeDir) {
     return res.status(400).json({ success: false, error: 'Directory does not exist.' });
   }
 
@@ -540,31 +613,37 @@ app.post('/api/repo/delete-branch', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Branch name is required.' });
   }
 
-  const currentBranchRes = await runCommand(dirPath, ['branch', '--show-current'], token);
+  const branchValidation = await validateBranchName(safeDir, branchToDelete, token);
+  if (!branchValidation.success) {
+    return res.status(400).json({ success: false, error: branchValidation.error });
+  }
+
+  const currentBranchRes = await runCommand(safeDir, ['branch', '--show-current'], token);
   if (currentBranchRes.success && currentBranchRes.stdout.trim() === branchToDelete) {
-    const branchesRes = await runCommand(dirPath, ['branch', '-r'], token);
+    const branchesRes = await runCommand(safeDir, ['branch', '-r'], token);
     const alternative = branchesRes.stdout.split('\n')
       .map(b => b.trim().replace(/^origin\//, ''))
       .find(b => b && b !== branchToDelete && !b.includes('HEAD'));
     
     if (alternative) {
-      await runCommand(dirPath, ['checkout', alternative], token);
+      await runCommand(safeDir, ['checkout', alternative], token);
     }
   }
 
-  const deleteRemoteRes = await runCommand(dirPath, ['push', 'origin', '--delete', branchToDelete], token);
+  const deleteRemoteRes = await runCommand(safeDir, ['push', 'origin', '--delete', branchToDelete], token);
   if (!deleteRemoteRes.success) {
     return res.json({ success: false, error: 'Failed to delete remote branch: ' + deleteRemoteRes.error });
   }
 
-  await runCommand(dirPath, ['branch', '-D', branchToDelete], token);
+  await runCommand(safeDir, ['branch', '-D', branchToDelete], token);
   res.json({ success: true });
 });
 
 // Reset branch to commit hash
 app.post('/api/repo/reset', async (req, res) => {
   const { dirPath, branch, hash } = req.body;
-  if (!dirPath || !fs.existsSync(dirPath)) {
+  const safeDir = resolveExistingDirectory(dirPath);
+  if (!safeDir) {
     return res.status(400).json({ success: false, error: 'Directory does not exist.' });
   }
 
@@ -575,14 +654,26 @@ app.post('/api/repo/reset', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Branch and hash are required.' });
   }
 
-  await runCommand(dirPath, ['checkout', branch], token);
+  const branchValidation = await validateBranchName(safeDir, branch, token);
+  if (!branchValidation.success) {
+    return res.status(400).json({ success: false, error: branchValidation.error });
+  }
+  const commitValidation = await validateCommitRef(safeDir, hash, token);
+  if (!commitValidation.success) {
+    return res.status(400).json({ success: false, error: commitValidation.error });
+  }
 
-  const resetRes = await runCommand(dirPath, ['reset', '--hard', hash], token);
+  const checkoutRes = await runCommand(safeDir, ['checkout', branch], token);
+  if (!checkoutRes.success) {
+    return res.json({ success: false, error: 'Failed to checkout branch before reset: ' + checkoutRes.error });
+  }
+
+  const resetRes = await runCommand(safeDir, ['reset', '--hard', hash], token);
   if (!resetRes.success) {
     return res.json({ success: false, error: 'Failed to reset local repository: ' + resetRes.error });
   }
 
-  const pushRes = await runCommand(dirPath, ['push', '-f', 'origin', branch], token);
+  const pushRes = await runCommand(safeDir, ['push', '--force-with-lease', 'origin', branch], token);
   if (!pushRes.success) {
     return res.json({ success: false, error: 'Failed to push reset state to remote: ' + pushRes.error });
   }
@@ -727,7 +818,8 @@ app.post('/api/github/repos/branches', async (req, res) => {
 // Bind physical directory to repository and checkout/push target branch
 app.post('/api/repo/bind', async (req, res) => {
   const { dirPath, remoteUrl, branch } = req.body;
-  if (!dirPath || !fs.existsSync(dirPath)) {
+  const safeDir = resolveExistingDirectory(dirPath);
+  if (!safeDir) {
     return res.status(400).json({ success: false, error: '本地物理路径不存在' });
   }
   if (!remoteUrl || !branch) {
@@ -736,6 +828,10 @@ app.post('/api/repo/bind', async (req, res) => {
 
   const config = loadConfig();
   const token = config.githubToken || '';
+  const branchValidation = await validateBranchName(safeDir, branch, token);
+  if (!branchValidation.success) {
+    return res.status(400).json({ success: false, error: branchValidation.error });
+  }
 
   // Clean remoteUrl by removing trailing slashes and adding .git suffix if missing
   let cleanRemoteUrl = remoteUrl.trim();
@@ -752,28 +848,28 @@ app.post('/api/repo/bind', async (req, res) => {
     authRemoteUrl = cleanRemoteUrl.replace(/https:\/\/github\.com\//, `https://oauth2:${token}@github.com/`);
   }
 
-  const gitDir = path.join(dirPath, '.git');
+  const gitDir = path.join(safeDir, '.git');
   const isRepo = fs.existsSync(gitDir) && fs.lstatSync(gitDir).isDirectory();
 
   // 1. If not a repo, init it
   if (!isRepo) {
-    const initRes = await runCommand(dirPath, ['init'], token);
+    const initRes = await runCommand(safeDir, ['init'], token);
     if (!initRes.success) {
       return res.json({ success: false, error: '初始化 Git 失败: ' + initRes.error });
     }
   }
 
   // Configure user details
-  await runCommand(dirPath, ['config', 'user.name', 'GitHub Auto Tool'], token);
-  await runCommand(dirPath, ['config', 'user.email', 'autotool@github.com'], token);
+  await runCommand(safeDir, ['config', 'user.name', 'GitHub Auto Tool'], token);
+  await runCommand(safeDir, ['config', 'user.email', 'autotool@github.com'], token);
 
   // 2. Set/update remote URL
-  const checkRemote = await runCommand(dirPath, ['remote'], token);
+  const checkRemote = await runCommand(safeDir, ['remote'], token);
   let setRemoteRes;
   if (checkRemote.stdout.includes('origin')) {
-    setRemoteRes = await runCommand(dirPath, ['remote', 'set-url', 'origin', authRemoteUrl], token);
+    setRemoteRes = await runCommand(safeDir, ['remote', 'set-url', 'origin', authRemoteUrl], token);
   } else {
-    setRemoteRes = await runCommand(dirPath, ['remote', 'add', 'origin', authRemoteUrl], token);
+    setRemoteRes = await runCommand(safeDir, ['remote', 'add', 'origin', authRemoteUrl], token);
   }
 
   if (!setRemoteRes.success) {
@@ -781,12 +877,12 @@ app.post('/api/repo/bind', async (req, res) => {
   }
 
   // 3. Fetch from remote
-  const fetchRes = await runCommand(dirPath, ['fetch', 'origin', branch], token);
+  const fetchRes = await runCommand(safeDir, ['fetch', 'origin', branch], token);
 
   // 4. Try checking out the target branch
   if (fetchRes.success) {
     // Branch exists remotely. Checkout to it.
-    const checkoutRes = await runCommand(dirPath, ['checkout', '-B', branch, `origin/${branch}`], token);
+    const checkoutRes = await runCommand(safeDir, ['checkout', '-B', branch, `origin/${branch}`], token);
     if (!checkoutRes.success) {
       return res.json({ success: false, error: '切换分支失败: ' + checkoutRes.error });
     }
@@ -794,24 +890,24 @@ app.post('/api/repo/bind', async (req, res) => {
     // Branch does NOT exist remotely. Let's create it locally and push to remote.
     // Check if we already have files in the folder. If so, stage & commit them.
     // If not, commit an empty commit.
-    const checkoutNewRes = await runCommand(dirPath, ['checkout', '-B', branch], token);
+    const checkoutNewRes = await runCommand(safeDir, ['checkout', '-B', branch], token);
     if (!checkoutNewRes.success) {
       return res.json({ success: false, error: '本地新建分支失败: ' + checkoutNewRes.error });
     }
 
     // Check status
-    const statusRes = await runCommand(dirPath, ['status', '--porcelain'], token);
+    const statusRes = await runCommand(safeDir, ['status', '--porcelain'], token);
     if (statusRes.stdout.length > 0) {
       // Stage & Commit
-      await runCommand(dirPath, ['add', '-A'], token);
-      await runCommand(dirPath, ['commit', '-m', `Initial commit on new branch ${branch}`], token);
+      await runCommand(safeDir, ['add', '-A'], token);
+      await runCommand(safeDir, ['commit', '-m', `Initial commit on new branch ${branch}`], token);
     } else {
       // Empty commit so there's a HEAD history to push
-      await runCommand(dirPath, ['commit', '--allow-empty', '-m', `Initial commit on new branch ${branch}`], token);
+      await runCommand(safeDir, ['commit', '--allow-empty', '-m', `Initial commit on new branch ${branch}`], token);
     }
 
     // Push it
-    const pushNewRes = await runCommand(dirPath, ['push', '-u', 'origin', branch], token);
+    const pushNewRes = await runCommand(safeDir, ['push', '-u', 'origin', branch], token);
     if (!pushNewRes.success) {
       return res.json({ success: false, error: '推送新分支到远程失败: ' + pushNewRes.error });
     }
@@ -826,22 +922,26 @@ app.post('/api/fs/validate-path', (req, res) => {
   if (!dirPath) {
     return res.json({ success: false, error: 'Path is required' });
   }
-  const absolute = path.resolve(dirPath);
-  if (fs.existsSync(absolute) && fs.lstatSync(absolute).isDirectory()) {
-    return res.json({ success: true, absolutePath: absolute });
+  const absolute = resolveExistingDirectory(dirPath);
+  if (!absolute) {
+    return res.json({ success: false, error: 'Directory does not exist' });
   }
-  res.json({ success: false, error: 'Directory does not exist' });
+  res.json({ success: true, absolutePath: absolute });
 });
 
 // Get Git Diff for a specific file (tracked or untracked)
 app.post('/api/repo/diff', async (req, res) => {
   const { dirPath, filePath } = req.body;
-  if (!dirPath || !filePath) {
+  const safeDir = resolveExistingDirectory(dirPath);
+  if (!safeDir || !filePath) {
     return res.status(400).json({ success: false, error: 'Workspace path and file path are required.' });
+  }
+  if (!isSafeRelativePathspec(filePath)) {
+    return res.status(400).json({ success: false, error: 'File path must be a repository-relative path.' });
   }
 
   // Check if file is untracked
-  const statusRes = await runCommand(dirPath, ['status', '--porcelain', filePath]);
+  const statusRes = await runCommand(safeDir, ['status', '--porcelain', filePath]);
   const statusLine = statusRes.success ? statusRes.stdout.trim() : '';
   const isUntracked = statusLine.startsWith('??');
 
@@ -849,11 +949,11 @@ app.post('/api/repo/diff', async (req, res) => {
   if (isUntracked) {
     const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
     // git diff --no-index NUL filePath represents the entire untracked file as addition
-    diffRes = await runCommand(dirPath, ['diff', '--no-index', nullDevice, filePath]);
+    diffRes = await runCommand(safeDir, ['diff', '--no-index', nullDevice, filePath]);
   } else {
-    const hasHeadRes = await runCommand(dirPath, ['rev-parse', '--verify', 'HEAD']);
+    const hasHeadRes = await runCommand(safeDir, ['rev-parse', '--verify', 'HEAD']);
     const diffBase = hasHeadRes.success ? 'HEAD' : '4b825dc642cb6eb9a0ff3e07f4618d9157b46363';
-    diffRes = await runCommand(dirPath, ['diff', diffBase, '--no-ext-diff', '--', filePath]);
+    diffRes = await runCommand(safeDir, ['diff', diffBase, '--no-ext-diff', '--', filePath]);
   }
 
   res.json({
@@ -865,7 +965,8 @@ app.post('/api/repo/diff', async (req, res) => {
 // Generate AI commit message from git diff
 app.post('/api/ai/generate-commit', async (req, res) => {
   const { dirPath } = req.body;
-  if (!dirPath || !fs.existsSync(dirPath)) {
+  const safeDir = resolveExistingDirectory(dirPath);
+  if (!safeDir) {
     return res.status(400).json({ success: false, error: 'Workspace directory does not exist.' });
   }
 
@@ -889,17 +990,17 @@ app.post('/api/ai/generate-commit', async (req, res) => {
   const aiModel = config.aiModelName || 'deepseek-chat';
 
   // Check if HEAD exists (handling empty repositories with no initial commits)
-  const hasHeadRes = await runCommand(dirPath, ['rev-parse', '--verify', 'HEAD']);
+  const hasHeadRes = await runCommand(safeDir, ['rev-parse', '--verify', 'HEAD']);
   const diffArgs = hasHeadRes.success
     ? ['diff', 'HEAD', '--no-ext-diff']
     : ['diff', '4b825dc642cb6eb9a0ff3e07f4618d9157b46363', '--no-ext-diff'];
 
-  const diffRes = await runCommand(dirPath, diffArgs);
+  const diffRes = await runCommand(safeDir, diffArgs);
   const diffText = diffRes.stdout || '';
 
   if (!diffText.trim()) {
     // If no tracked modifications, check for untracked/unstaged changes
-    const statusRes = await runCommand(dirPath, ['status', '--porcelain']);
+    const statusRes = await runCommand(safeDir, ['status', '--porcelain']);
     if (statusRes.stdout.trim().length === 0) {
       return res.json({ success: false, error: '工作区完全干净，没有任何改动需要提交。' });
     } else {
@@ -1002,6 +1103,6 @@ app.post('/api/github/actions/runs', async (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+app.listen(PORT, '127.0.0.1', () => {
   console.log(`GitHub Auto Tool Server listening at http://localhost:${PORT}`);
 });
