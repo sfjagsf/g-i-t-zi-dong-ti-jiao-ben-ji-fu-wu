@@ -1425,6 +1425,11 @@ async function pollLogs() {
       consoleOutputBox.appendChild(line);
     });
     
+    // Cap console DOM elements to 200 to prevent rendering lag
+    while (consoleOutputBox.children.length > 200) {
+      consoleOutputBox.removeChild(consoleOutputBox.firstChild);
+    }
+    
     consoleOutputBox.scrollTop = consoleOutputBox.scrollHeight;
     logOffset = res.nextOffset;
   }
@@ -1482,6 +1487,6 @@ document.addEventListener('DOMContentLoaded', () => {
   lucide.createIcons();
   loadServerConfig();
   
-  // Poll logs every 500ms
-  setInterval(pollLogs, 500);
+  // Poll logs every 1500ms
+  setInterval(pollLogs, 1500);
 });

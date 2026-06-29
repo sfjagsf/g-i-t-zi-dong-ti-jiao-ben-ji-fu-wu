@@ -65,6 +65,7 @@ body {
   background: radial-gradient(circle, rgba(79, 172, 254, 0.15) 0%, rgba(0, 0, 0, 0) 70%);
   filter: blur(80px);
   animation: floatGlow 20s infinite alternate;
+  will-change: transform;
 }
 
 .glow-2 {
@@ -76,6 +77,7 @@ body {
   background: radial-gradient(circle, rgba(218, 34, 255, 0.1) 0%, rgba(0, 0, 0, 0) 70%);
   filter: blur(80px);
   animation: floatGlow 25s infinite alternate-reverse;
+  will-change: transform;
 }
 
 @keyframes floatGlow {
@@ -86,8 +88,8 @@ body {
 /* Glassmorphism Utility */
 .glass {
   background: var(--panel-bg);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   border: 1px solid var(--border-color);
   border-radius: 12px;
 }
