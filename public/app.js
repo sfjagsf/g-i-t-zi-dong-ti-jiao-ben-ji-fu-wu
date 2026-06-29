@@ -751,6 +751,31 @@ async function refreshLocalChanges() {
   }
 }
 
+function normalizeChangeEntry(change) {
+  if (typeof change === 'string') {
+    return {
+      status: change.substring(0, 2),
+      path: change.substring(3)
+    };
+  }
+
+  return {
+    status: change.status || '',
+    path: change.path || '',
+    oldPath: change.oldPath || ''
+  };
+}
+
+function getChangeBadge(status) {
+  if (status.includes('R')) return { badgeClass: 'status-a', badgeText: 'REN' };
+  if (status.includes('C')) return { badgeClass: 'status-a', badgeText: 'CPY' };
+  if (status.includes('?')) return { badgeClass: 'status-u', badgeText: 'NEW' };
+  if (status.includes('D')) return { badgeClass: 'status-d', badgeText: 'DEL' };
+  if (status.includes('A')) return { badgeClass: 'status-a', badgeText: 'ADD' };
+  if (status.includes('U')) return { badgeClass: 'status-d', badgeText: 'CON' };
+  return { badgeClass: 'status-m', badgeText: 'MOD' };
+}
+
 // Render uncommitted files list
 function renderFileChanges(files) {
   fileChangesListContainer.innerHTML = '';
@@ -761,9 +786,11 @@ function renderFileChanges(files) {
     return;
   }
 
-  files.forEach(fileLine => {
-    const statusFlag = fileLine.substring(0, 2).trim();
-    const filePath = fileLine.substring(3);
+  files.forEach(changeEntry => {
+    const change = normalizeChangeEntry(changeEntry);
+    const filePath = change.path;
+    const displayPath = change.oldPath ? `${change.oldPath} -> ${change.path}` : change.path;
+    const badgeInfo = getChangeBadge(change.status);
 
     const item = document.createElement('div');
     item.className = 'file-change-item clickable';
@@ -771,31 +798,14 @@ function renderFileChanges(files) {
     const info = document.createElement('div');
     info.className = 'file-info';
 
-    let badgeClass = 'status-m';
-    let badgeText = 'M';
-
-    if (statusFlag === 'M') {
-      badgeClass = 'status-m';
-      badgeText = 'MOD';
-    } else if (statusFlag === 'A') {
-      badgeClass = 'status-a';
-      badgeText = 'ADD';
-    } else if (statusFlag === 'D') {
-      badgeClass = 'status-d';
-      badgeText = 'DEL';
-    } else if (statusFlag === '??') {
-      badgeClass = 'status-u';
-      badgeText = 'NEW';
-    }
-
     const badge = document.createElement('span');
-    badge.className = `file-status-badge ${badgeClass}`;
-    badge.innerText = badgeText;
+    badge.className = `file-status-badge ${badgeInfo.badgeClass}`;
+    badge.innerText = badgeInfo.badgeText;
 
     const fileName = document.createElement('span');
     fileName.className = 'file-name';
-    fileName.title = filePath;
-    fileName.innerText = filePath;
+    fileName.title = displayPath;
+    fileName.innerText = displayPath;
 
     info.appendChild(badge);
     info.appendChild(fileName);
@@ -804,7 +814,9 @@ function renderFileChanges(files) {
     
     // Bind click event to trigger visual diff modal
     item.addEventListener('click', () => {
-      showFileDiff(filePath);
+      if (filePath) {
+        showFileDiff(filePath, change.oldPath);
+      }
     });
 
     fileChangesListContainer.appendChild(item);
@@ -847,12 +859,12 @@ function renderDiffHtml() {
 }
 
 // Fetch and display code diff
-async function showFileDiff(filePath) {
+async function showFileDiff(filePath, oldPath = '') {
   const dirPath = pathInput.value.trim();
   if (!dirPath) return;
 
   addSystemLog(`正在读取文件 [${filePath}] 的改动差异对比...`);
-  const res = await apiPost('/api/repo/diff', { dirPath, filePath });
+  const res = await apiPost('/api/repo/diff', { dirPath, filePath, oldPath });
 
   if (res.success) {
     currentDiffText = res.diff;

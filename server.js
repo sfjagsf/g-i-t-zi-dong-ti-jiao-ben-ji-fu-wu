@@ -117,6 +117,40 @@ function remoteListHasOrigin(remoteOutput) {
   return remoteOutput.split('\n').map(remote => remote.trim()).includes('origin');
 }
 
+function parseGitStatusPorcelainZ(output) {
+  if (!output) return [];
+
+  const parts = output.split('\0');
+  const changes = [];
+
+  for (let i = 0; i < parts.length; i += 1) {
+    const record = parts[i];
+    if (!record) continue;
+
+    const status = record.slice(0, 2);
+    const filePath = record.slice(3);
+    if (!filePath) continue;
+
+    const change = {
+      status,
+      indexStatus: status[0],
+      worktreeStatus: status[1],
+      path: filePath
+    };
+
+    if (status[0] === 'R' || status[0] === 'C') {
+      i += 1;
+      if (parts[i]) {
+        change.oldPath = parts[i];
+      }
+    }
+
+    changes.push(change);
+  }
+
+  return changes;
+}
+
 async function localBranchExists(cwd, branch, token = '') {
   const result = await runCommand(cwd, ['show-ref', '--verify', `refs/heads/${branch}`], token);
   return result.success;
@@ -409,9 +443,9 @@ app.post('/api/repo/status', async (req, res) => {
   }
 
   // Check status of changes
-  const statusResult = await runCommand(safeDir, ['status', '--porcelain'], token);
-  const hasChanges = statusResult.success && statusResult.stdout.length > 0;
-  const changesList = statusResult.success ? statusResult.stdout.split('\n').filter(Boolean) : [];
+  const statusResult = await runCommand(safeDir, ['status', '--porcelain=v1', '-z'], token, { trimOutput: false });
+  const changesList = statusResult.success ? parseGitStatusPorcelainZ(statusResult.stdout) : [];
+  const hasChanges = changesList.length > 0;
 
   res.json({
     success: true,
@@ -1040,7 +1074,7 @@ app.post('/api/fs/validate-path', (req, res) => {
 
 // Get Git Diff for a specific file (tracked or untracked)
 app.post('/api/repo/diff', async (req, res) => {
-  const { dirPath, filePath } = req.body;
+  const { dirPath, filePath, oldPath } = req.body;
   const safeDir = resolveExistingDirectory(dirPath);
   if (!safeDir || !filePath) {
     return res.status(400).json({ success: false, error: 'Workspace path and file path are required.' });
@@ -1048,21 +1082,29 @@ app.post('/api/repo/diff', async (req, res) => {
   if (!isSafeRelativePathspec(filePath)) {
     return res.status(400).json({ success: false, error: 'File path must be a repository-relative path.' });
   }
+  if (oldPath && !isSafeRelativePathspec(oldPath)) {
+    return res.status(400).json({ success: false, error: 'Old file path must be a repository-relative path.' });
+  }
+
+  const config = loadConfig();
+  const token = config.githubToken || '';
 
   // Check if file is untracked
-  const statusRes = await runCommand(safeDir, ['status', '--porcelain', filePath]);
-  const statusLine = statusRes.success ? statusRes.stdout.trim() : '';
-  const isUntracked = statusLine.startsWith('??');
+  const statusRes = await runCommand(safeDir, ['status', '--porcelain=v1', '-z', '--', filePath], token, { trimOutput: false });
+  const statusEntries = statusRes.success ? parseGitStatusPorcelainZ(statusRes.stdout) : [];
+  const statusEntry = statusEntries.find(entry => entry.path === filePath || entry.oldPath === filePath);
+  const isUntracked = statusEntry && statusEntry.status === '??';
+  const diffPaths = oldPath ? [oldPath, filePath] : [filePath];
 
   let diffRes;
   if (isUntracked) {
     const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
     // git diff --no-index NUL filePath represents the entire untracked file as addition
-    diffRes = await runCommand(safeDir, ['diff', '--no-index', nullDevice, filePath]);
+    diffRes = await runCommand(safeDir, ['diff', '--no-index', '--', nullDevice, filePath], token);
   } else {
-    const hasHeadRes = await runCommand(safeDir, ['rev-parse', '--verify', 'HEAD']);
+    const hasHeadRes = await runCommand(safeDir, ['rev-parse', '--verify', 'HEAD'], token);
     const diffBase = hasHeadRes.success ? 'HEAD' : '4b825dc642cb6eb9a0ff3e07f4618d9157b46363';
-    diffRes = await runCommand(safeDir, ['diff', diffBase, '--no-ext-diff', '--', filePath]);
+    diffRes = await runCommand(safeDir, ['diff', diffBase, '--no-ext-diff', '--', ...diffPaths], token);
   }
 
   res.json({
@@ -1084,13 +1126,14 @@ app.post('/api/ai/generate-commit', async (req, res) => {
 
   const aiKey = config.aiApiKey || '';
   const aiModel = config.aiModelName || 'deepseek-chat';
+  const token = config.githubToken || '';
 
-  const diffText = await getDiffIncludingUntracked(safeDir);
+  const diffText = await getDiffIncludingUntracked(safeDir, token);
 
   if (!diffText.trim()) {
     // If no tracked modifications, check for untracked/unstaged changes
-    const statusRes = await runCommand(safeDir, ['status', '--porcelain']);
-    if (statusRes.stdout.trim().length === 0) {
+    const statusRes = await runCommand(safeDir, ['status', '--porcelain=v1', '-z'], token, { trimOutput: false });
+    if (parseGitStatusPorcelainZ(statusRes.stdout).length === 0) {
       return res.json({ success: false, error: '工作区完全干净，没有任何改动需要提交。' });
     } else {
       return res.json({ success: false, error: '检测到改动，但未能生成有效 diff。请手动输入描述。' });
