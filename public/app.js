@@ -14,6 +14,13 @@ let selectedBranch = '';
 let selectedCommitHash = '';
 let logOffset = 0;
 let githubActionRuns = [];
+let logPollTimer = null;
+let isLogPolling = false;
+
+const MAX_CONSOLE_LINES = 200;
+const LOG_POLL_VISIBLE_MS = 2000;
+const LOG_POLL_HIDDEN_MS = 8000;
+const MAX_RENDERED_DIFF_CHARS = 600000;
 
 // Repository dropdown and branch list caches
 let globalReposList = [];
@@ -143,13 +150,33 @@ function toggleAuthModal() {
   }
 }
 
+function capConsoleLines() {
+  while (consoleOutputBox.children.length > MAX_CONSOLE_LINES) {
+    consoleOutputBox.removeChild(consoleOutputBox.firstChild);
+  }
+}
+
+function appendConsoleLines(logs) {
+  const fragment = document.createDocumentFragment();
+
+  logs.forEach(log => {
+    const line = document.createElement('div');
+    line.className = `console-line ${log.type}`;
+    line.innerText = log.text;
+    fragment.appendChild(line);
+  });
+
+  consoleOutputBox.appendChild(fragment);
+  capConsoleLines();
+  consoleOutputBox.scrollTop = consoleOutputBox.scrollHeight;
+}
+
 // Write system logs to console
 function addSystemLog(text) {
-  const line = document.createElement('div');
-  line.className = 'console-line system';
-  line.innerText = `// ${new Date().toLocaleTimeString()} - ${text}`;
-  consoleOutputBox.appendChild(line);
-  consoleOutputBox.scrollTop = consoleOutputBox.scrollHeight;
+  appendConsoleLines([{
+    type: 'system',
+    text: `// ${new Date().toLocaleTimeString()} - ${text}`
+  }]);
 }
 
 function appendIcon(parent, name, className = '') {
@@ -496,6 +523,8 @@ function populateBranchesUI(repo, branches) {
     branches = ['main'];
   }
 
+  const fragment = document.createDocumentFragment();
+
   branches.forEach(branch => {
     // Check if this repository/branch is currently active
     const isActive = currentRepoStatus.isRepo && 
@@ -557,9 +586,10 @@ function populateBranchesUI(repo, branches) {
       bindLocalDirectoryToBranch(repo, branch);
     });
 
-    branchesListContainer.appendChild(item);
+    fragment.appendChild(item);
   });
 
+  branchesListContainer.appendChild(fragment);
   lucide.createIcons();
 }
 
@@ -786,6 +816,8 @@ function renderFileChanges(files) {
     return;
   }
 
+  const fragment = document.createDocumentFragment();
+
   files.forEach(changeEntry => {
     const change = normalizeChangeEntry(changeEntry);
     const filePath = change.path;
@@ -819,8 +851,10 @@ function renderFileChanges(files) {
       }
     });
 
-    fileChangesListContainer.appendChild(item);
+    fragment.appendChild(item);
   });
+
+  fileChangesListContainer.appendChild(fragment);
 }
 
 // Close Diff Modal overlay
@@ -849,13 +883,29 @@ function renderDiffHtml() {
     return;
   }
 
-  const html = Diff2Html.html(currentDiffText, {
+  let diffToRender = currentDiffText;
+  let truncated = false;
+  if (diffToRender.length > MAX_RENDERED_DIFF_CHARS) {
+    diffToRender = diffToRender.slice(0, MAX_RENDERED_DIFF_CHARS);
+    truncated = true;
+  }
+
+  const html = Diff2Html.html(diffToRender, {
     drawFileList: false,
     matching: 'lines',
     outputFormat: currentDiffFormat
   });
 
-  diffBody.innerHTML = html;
+  if (truncated) {
+    diffBody.innerHTML = '';
+    const warning = document.createElement('div');
+    warning.className = 'empty-state-text text-warning';
+    warning.innerText = 'Diff 内容较大，已截取前半部分渲染以避免页面卡顿。';
+    diffBody.appendChild(warning);
+    diffBody.insertAdjacentHTML('beforeend', html);
+  } else {
+    diffBody.innerHTML = html;
+  }
 }
 
 // Fetch and display code diff
@@ -1429,23 +1479,33 @@ async function deleteGithubRepo(owner, repoName) {
 
 // Console terminal polling logs
 async function pollLogs() {
-  const res = await apiGet(`/api/git-logs?offset=${logOffset}`);
-  if (res && res.success && Array.isArray(res.logs) && res.logs.length > 0) {
-    res.logs.forEach(log => {
-      const line = document.createElement('div');
-      line.className = `console-line ${log.type}`;
-      line.innerText = log.text;
-      consoleOutputBox.appendChild(line);
-    });
-    
-    // Cap console DOM elements to 200 to prevent rendering lag
-    while (consoleOutputBox.children.length > 200) {
-      consoleOutputBox.removeChild(consoleOutputBox.firstChild);
-    }
-    
-    consoleOutputBox.scrollTop = consoleOutputBox.scrollHeight;
-    logOffset = res.nextOffset;
+  if (isLogPolling) {
+    scheduleLogPolling();
+    return;
   }
+
+  isLogPolling = true;
+  try {
+    if (document.hidden) return;
+
+    const res = await apiGet(`/api/git-logs?offset=${logOffset}`);
+    if (res && res.success && Array.isArray(res.logs)) {
+      if (res.logs.length > 0) {
+        appendConsoleLines(res.logs);
+      }
+      logOffset = res.nextOffset;
+    }
+  } finally {
+    isLogPolling = false;
+    scheduleLogPolling();
+  }
+}
+
+function scheduleLogPolling(delay = document.hidden ? LOG_POLL_HIDDEN_MS : LOG_POLL_VISIBLE_MS) {
+  if (logPollTimer) {
+    clearTimeout(logPollTimer);
+  }
+  logPollTimer = setTimeout(pollLogs, delay);
 }
 
 // Clear console logs
@@ -1495,11 +1555,14 @@ createRepoModal.addEventListener('click', (e) => {
   if (e.target === createRepoModal) closeCreateRepoModal();
 });
 
+document.addEventListener('visibilitychange', () => {
+  scheduleLogPolling(document.hidden ? LOG_POLL_HIDDEN_MS : 0);
+});
+
 // Initialization
 document.addEventListener('DOMContentLoaded', () => {
   lucide.createIcons();
   loadServerConfig();
   
-  // Poll logs every 1500ms
-  setInterval(pollLogs, 1500);
+  scheduleLogPolling(0);
 });
