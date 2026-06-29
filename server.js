@@ -198,6 +198,24 @@ async function callGithubApi(method, apiPath, body, token) {
   }
 }
 
+function normalizeChatCompletionsUrl(rawUrl) {
+  const defaultUrl = 'http://localhost:11434/v1/chat/completions';
+  const value = typeof rawUrl === 'string' && rawUrl.trim() ? rawUrl.trim() : defaultUrl;
+  const trimmed = value.replace(/\/+$/, '');
+  const lower = trimmed.toLowerCase();
+
+  if (lower.endsWith('/chat/completions')) {
+    return trimmed;
+  }
+  if (lower.endsWith('/v1')) {
+    return `${trimmed}/chat/completions`;
+  }
+  if (lower.includes('/v1/')) {
+    return `${trimmed}/chat/completions`;
+  }
+  return `${trimmed}/v1/chat/completions`;
+}
+
 // Get config
 app.get('/api/config', (req, res) => {
   res.json(publicConfig(loadConfig()));
@@ -971,20 +989,7 @@ app.post('/api/ai/generate-commit', async (req, res) => {
   }
 
   const config = loadConfig();
-  let aiUrl = config.aiApiUrl ? config.aiApiUrl.trim() : 'http://localhost:11434/v1/chat/completions';
-  
-  if (aiUrl && !aiUrl.endsWith('/chat/completions')) {
-    aiUrl = aiUrl.replace(/\/+$/, '');
-    if (aiUrl.endsWith('/v1')) {
-      aiUrl += '/chat/completions';
-    } else {
-      if (aiUrl.includes('/v1')) {
-        aiUrl += '/chat/completions';
-      } else {
-        aiUrl += '/v1/chat/completions';
-      }
-    }
-  }
+  const aiUrl = normalizeChatCompletionsUrl(config.aiApiUrl);
 
   const aiKey = config.aiApiKey || '';
   const aiModel = config.aiModelName || 'deepseek-chat';
