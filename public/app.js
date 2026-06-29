@@ -1,5 +1,14 @@
 // Global state
-let currentConfig = { githubToken: '', lastProjectPath: '', recentPaths: [], aiApiUrl: '', aiApiKey: '', aiModelName: '' };
+let currentConfig = {
+  hasGithubToken: false,
+  hasAiApiKey: false,
+  username: '',
+  avatarUrl: '',
+  lastProjectPath: '',
+  recentPaths: [],
+  aiApiUrl: '',
+  aiModelName: ''
+};
 let currentRepoStatus = { isRepo: false, remoteUrl: '', currentBranch: '', hasChanges: false, changesList: [] };
 let selectedBranch = '';
 let selectedCommitHash = '';
@@ -120,9 +129,16 @@ function showCustomDialog({ title, message, confirmText = '确认', cancelText =
 function toggleAuthModal() {
   authModal.classList.toggle('hidden');
   if (!authModal.classList.contains('hidden')) {
-    if (currentConfig.githubToken) tokenInput.value = currentConfig.githubToken;
+    tokenInput.value = '';
+    tokenInput.placeholder = currentConfig.hasGithubToken
+      ? '已保存 GitHub Token，留空保持不变'
+      : 'ghp_xxxxxxxxxxxxxxxxxxxx';
     document.getElementById('ai-url-input').value = currentConfig.aiApiUrl || '';
-    document.getElementById('ai-key-input').value = currentConfig.aiApiKey || '';
+    const aiKeyInput = document.getElementById('ai-key-input');
+    aiKeyInput.value = '';
+    aiKeyInput.placeholder = currentConfig.hasAiApiKey
+      ? '已保存 AI API Key，留空保持不变'
+      : 'sk-xxxxxxxxxxxxxxxxxxxx';
     document.getElementById('ai-model-input').value = currentConfig.aiModelName || '';
   }
 }
@@ -166,8 +182,8 @@ async function loadServerConfig() {
   const config = await apiGet('/api/config');
   if (config) {
     currentConfig = config;
-    if (config.githubToken) {
-      tokenInput.value = config.githubToken;
+    if (config.hasGithubToken) {
+      tokenInput.value = '';
       updateAuthUI(true, config.username || 'GitHub 账户已关联', config.avatarUrl);
       await fetchGithubRepos(); // Fetch repos immediately
     } else {
@@ -176,7 +192,7 @@ async function loadServerConfig() {
 
     // Populate AI Settings fields
     document.getElementById('ai-url-input').value = config.aiApiUrl || '';
-    document.getElementById('ai-key-input').value = config.aiApiKey || '';
+    document.getElementById('ai-key-input').value = '';
     document.getElementById('ai-model-input').value = config.aiModelName || '';
 
     // Populate recent paths dropdown
@@ -279,32 +295,35 @@ btnSaveToken.addEventListener('click', async () => {
   const aiKey = document.getElementById('ai-key-input').value.trim();
   const aiModel = document.getElementById('ai-model-input').value.trim();
 
-  if (!token) {
+  if (!token && !currentConfig.hasGithubToken) {
     addSystemLog('Token 不能为空。');
     return;
   }
 
-  addSystemLog('正在验证 GitHub Token...');
-  const profile = await fetchGithubProfile(token);
+  let profile = null;
+  if (token) {
+    addSystemLog('正在验证 GitHub Token...');
+    profile = await fetchGithubProfile(token);
+  }
   
   let saveObj = {
-    githubToken: token,
     aiApiUrl: aiUrl,
-    aiApiKey: aiKey,
     aiModelName: aiModel
   };
+  if (token) saveObj.githubToken = token;
+  if (aiKey) saveObj.aiApiKey = aiKey;
   if (profile) {
     saveObj.username = profile.username;
     saveObj.avatarUrl = profile.avatarUrl;
     addSystemLog(`GitHub 认证成功: ${profile.username}`);
-  } else {
+  } else if (token) {
     addSystemLog('无法获取 GitHub 个人信息，请检查 Token 权限（已保存凭证）。');
   }
 
   const res = await apiPost('/api/config', saveObj);
   if (res.success) {
     currentConfig = res.config;
-    updateAuthUI(true, profile ? profile.username : 'GitHub 账户已关联', profile ? profile.avatarUrl : '');
+    updateAuthUI(true, res.config.username || 'GitHub 账户已关联', res.config.avatarUrl || '');
     toggleAuthModal();
     fetchGithubRepos(); // Refresh repositories
   }
@@ -312,7 +331,7 @@ btnSaveToken.addEventListener('click', async () => {
 
 // Fetch GitHub User Repositories
 async function fetchGithubRepos() {
-  if (!currentConfig.githubToken) return;
+  if (!currentConfig.hasGithubToken) return;
   
   repoSelect.innerHTML = '<option value="">正在读取仓库列表...</option>';
   
@@ -883,7 +902,7 @@ function formatGraphSymbols(symbols) {
 
 // Fetch GitHub Actions run status in background
 async function loadActionsRunsForRepo() {
-  if (!activeSelectedRepo || !currentConfig.githubToken) return;
+  if (!activeSelectedRepo || !currentConfig.hasGithubToken) return;
 
   const res = await apiPost('/api/github/actions/runs', {
     owner: activeSelectedRepo.owner,
@@ -1202,7 +1221,7 @@ pathInput.addEventListener('keydown', (e) => {
 
 // Open / Close Create Repo Modal
 btnOpenCreateRepo.addEventListener('click', () => {
-  if (!currentConfig.githubToken) {
+  if (!currentConfig.hasGithubToken) {
     addSystemLog('请先关联 GitHub Access Token！');
     return;
   }

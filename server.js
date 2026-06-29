@@ -1,8 +1,7 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const { exec, execFile } = require('child_process');
-const https = require('https');
+const { execFile } = require('child_process');
 const pinyin = require('tiny-pinyin');
 
 const app = express();
@@ -11,22 +10,41 @@ const PORT = 13000;
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Path to store config
-const CONFIG_FILE = path.join(__dirname, 'config.json');
+// Tracked config.json is a safe defaults file. Secrets are saved locally only.
+const CONFIG_DEFAULT_FILE = path.join(__dirname, 'config.json');
+const CONFIG_FILE = process.env.GFLOW_CONFIG_FILE || path.join(__dirname, 'config.local.json');
+const SENSITIVE_CONFIG_KEYS = new Set(['githubToken', 'aiApiKey']);
 
 // Memory logs of executed git commands
 let gitCommandLogs = [];
 
-// Helper to load config
-function loadConfig() {
-  if (fs.existsSync(CONFIG_FILE)) {
+function readJsonFile(filePath) {
+  if (fs.existsSync(filePath)) {
     try {
-      return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
     } catch (e) {
       return {};
     }
   }
   return {};
+}
+
+// Helper to load config
+function loadConfig() {
+  return {
+    ...readJsonFile(CONFIG_DEFAULT_FILE),
+    ...readJsonFile(CONFIG_FILE)
+  };
+}
+
+function publicConfig(config) {
+  const safeConfig = { ...config };
+  for (const key of SENSITIVE_CONFIG_KEYS) {
+    safeConfig[key] = '';
+  }
+  safeConfig.hasGithubToken = !!config.githubToken;
+  safeConfig.hasAiApiKey = !!config.aiApiKey;
+  return safeConfig;
 }
 
 // Helper to save config
@@ -144,15 +162,36 @@ async function callGithubApi(method, apiPath, body, token) {
 
 // Get config
 app.get('/api/config', (req, res) => {
-  res.json(loadConfig());
+  res.json(publicConfig(loadConfig()));
 });
 
 // Update config
 app.post('/api/config', (req, res) => {
   const current = loadConfig();
-  const updated = { ...current, ...req.body };
+  const incoming = req.body || {};
+  const updated = { ...current };
+  const allowedFields = [
+    'githubToken',
+    'username',
+    'avatarUrl',
+    'aiApiUrl',
+    'aiApiKey',
+    'aiModelName',
+    'lastProjectPath',
+    'recentPaths'
+  ];
+
+  for (const field of allowedFields) {
+    if (!Object.prototype.hasOwnProperty.call(incoming, field)) continue;
+    const value = incoming[field];
+    if (SENSITIVE_CONFIG_KEYS.has(field) && typeof value === 'string' && value.includes('*')) {
+      continue;
+    }
+    updated[field] = value;
+  }
+
   saveConfig(updated);
-  res.json({ success: true, config: updated });
+  res.json({ success: true, config: publicConfig(updated) });
 });
 
 // Get Git commands logs (supporting incremental polling with offset)
