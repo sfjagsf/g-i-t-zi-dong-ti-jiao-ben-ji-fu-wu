@@ -5,7 +5,7 @@ const { execFile } = require('child_process');
 const pinyin = require('tiny-pinyin');
 
 const app = express();
-const PORT = 13000;
+const PORT = Number(process.env.PORT || 13000);
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -1235,6 +1235,16 @@ app.post('/api/github/actions/runs', async (req, res) => {
 });
 
 // Start server
-app.listen(PORT, '127.0.0.1', () => {
+const server = app.listen(PORT, '127.0.0.1', () => {
   console.log(`GitHub Auto Tool Server listening at http://localhost:${PORT}`);
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`端口 ${PORT} 已被占用，服务未启动。`);
+    console.error(`请先关闭已有服务，或使用其他端口启动，例如：$env:PORT=13001; npm start`);
+    process.exit(1);
+  }
+
+  throw err;
 });
