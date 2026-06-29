@@ -63,6 +63,23 @@ function maskToken(str, token) {
   return masked;
 }
 
+function buildGitEnv(token = '') {
+  const env = {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: '0',
+    GCM_INTERACTIVE: 'Never'
+  };
+
+  if (token) {
+    const basicAuth = Buffer.from(`x-access-token:${token}`, 'utf8').toString('base64');
+    env.GIT_CONFIG_COUNT = '1';
+    env.GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader';
+    env.GIT_CONFIG_VALUE_0 = `AUTHORIZATION: basic ${basicAuth}`;
+  }
+
+  return env;
+}
+
 function resolveExistingDirectory(dirPath) {
   if (typeof dirPath !== 'string' || !dirPath.trim()) return null;
   const absolute = path.resolve(dirPath.trim());
@@ -127,7 +144,12 @@ function runCommand(cwd, args, token = '') {
       gitCommandLogs.shift();
     }
 
-    execFile('git', args, { cwd, maxBuffer: 1024 * 1024 * 10, encoding: 'utf8' }, (error, stdout, stderr) => {
+    execFile('git', args, {
+      cwd,
+      env: buildGitEnv(token),
+      maxBuffer: 1024 * 1024 * 10,
+      encoding: 'utf8'
+    }, (error, stdout, stderr) => {
       const outText = stdout ? stdout.trim() : '';
       const errText = stderr ? stderr.trim() : '';
       
@@ -339,12 +361,6 @@ app.post('/api/repo/init', async (req, res) => {
     cleanRemoteUrl += '.git';
   }
 
-  // Inject token into Git remote URL if present
-  let authRemoteUrl = cleanRemoteUrl;
-  if (token) {
-    authRemoteUrl = cleanRemoteUrl.replace(/https:\/\/github\.com\//, `https://oauth2:${token}@github.com/`);
-  }
-
   const gitDir = path.join(safeDir, '.git');
   const isRepo = fs.existsSync(gitDir);
 
@@ -358,9 +374,9 @@ app.post('/api/repo/init', async (req, res) => {
   const checkRemote = await runCommand(safeDir, ['remote'], token);
   let setRemoteRes;
   if (checkRemote.stdout.includes('origin')) {
-    setRemoteRes = await runCommand(safeDir, ['remote', 'set-url', 'origin', authRemoteUrl], token);
+    setRemoteRes = await runCommand(safeDir, ['remote', 'set-url', 'origin', cleanRemoteUrl], token);
   } else {
-    setRemoteRes = await runCommand(safeDir, ['remote', 'add', 'origin', authRemoteUrl], token);
+    setRemoteRes = await runCommand(safeDir, ['remote', 'add', 'origin', cleanRemoteUrl], token);
   }
 
   if (!setRemoteRes.success) {
@@ -376,17 +392,18 @@ app.post('/api/repo/init', async (req, res) => {
 // Fetch and list remote branches (via git ls-remote)
 app.post('/api/repo/branches', async (req, res) => {
   const { dirPath } = req.body;
-  if (!dirPath || !fs.existsSync(dirPath)) {
+  const safeDir = resolveExistingDirectory(dirPath);
+  if (!safeDir) {
     return res.status(400).json({ success: false, error: 'Directory does not exist.' });
   }
 
   const config = loadConfig();
   const token = config.githubToken || '';
 
-  const lsRes = await runCommand(dirPath, ['ls-remote', '--heads', 'origin'], token);
+  const lsRes = await runCommand(safeDir, ['ls-remote', '--heads', 'origin'], token);
   if (!lsRes.success) {
-    await runCommand(dirPath, ['fetch', 'origin'], token);
-    const localTrackingRes = await runCommand(dirPath, ['branch', '-r'], token);
+    await runCommand(safeDir, ['fetch', 'origin'], token);
+    const localTrackingRes = await runCommand(safeDir, ['branch', '-r'], token);
     if (!localTrackingRes.success) {
       return res.json({ success: false, error: 'Failed to retrieve branches: ' + lsRes.error });
     }
@@ -860,12 +877,6 @@ app.post('/api/repo/bind', async (req, res) => {
     cleanRemoteUrl += '.git';
   }
 
-  // Inject token
-  let authRemoteUrl = cleanRemoteUrl;
-  if (token) {
-    authRemoteUrl = cleanRemoteUrl.replace(/https:\/\/github\.com\//, `https://oauth2:${token}@github.com/`);
-  }
-
   const gitDir = path.join(safeDir, '.git');
   const isRepo = fs.existsSync(gitDir) && fs.lstatSync(gitDir).isDirectory();
 
@@ -885,9 +896,9 @@ app.post('/api/repo/bind', async (req, res) => {
   const checkRemote = await runCommand(safeDir, ['remote'], token);
   let setRemoteRes;
   if (checkRemote.stdout.includes('origin')) {
-    setRemoteRes = await runCommand(safeDir, ['remote', 'set-url', 'origin', authRemoteUrl], token);
+    setRemoteRes = await runCommand(safeDir, ['remote', 'set-url', 'origin', cleanRemoteUrl], token);
   } else {
-    setRemoteRes = await runCommand(safeDir, ['remote', 'add', 'origin', authRemoteUrl], token);
+    setRemoteRes = await runCommand(safeDir, ['remote', 'add', 'origin', cleanRemoteUrl], token);
   }
 
   if (!setRemoteRes.success) {
