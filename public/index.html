@@ -10,6 +10,9 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
   <!-- Lucide Icons -->
   <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- Diff2Html CSS & JS -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/diff2html/3.4.48/diff2html.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/diff2html/3.4.48/diff2html.min.js"></script>
   <!-- Main Stylesheet -->
   <link rel="stylesheet" href="style.css">
 </head>
@@ -131,7 +134,7 @@
           <div class="changes-list-wrapper scrollbar-custom">
             <div class="section-title changes-header-row">
               <div class="changes-title-left">
-                <h3>本地改动状态</h3>
+                <h3>本地改动状态 <span class="tip-small">(点击查看 Diff)</span></h3>
                 <span id="changes-count-badge" class="count-badge">0</span>
               </div>
               <!-- Manual refresh local changes button -->
@@ -147,7 +150,13 @@
           <!-- Commit Form -->
           <div class="commit-form-wrapper">
             <div class="form-group">
-              <label for="commit-desc-input">提交描述 <span class="required">*</span></label>
+              <div class="commit-header-row">
+                <label for="commit-desc-input">提交描述 <span class="required">*</span></label>
+                <button id="btn-ai-commit" class="btn btn-primary-outline btn-xs" title="通过 AI 智能生成提交描述">
+                  <span id="ai-btn-text">✨ AI 智能生成</span>
+                  <span id="ai-btn-spinner" class="hidden"><i data-lucide="loader" class="icon-xs spin-icon"></i></span>
+                </button>
+              </div>
               <textarea id="commit-desc-input" rows="3" placeholder="请输入本次提交的详细描述..."></textarea>
             </div>
             <button id="btn-commit-push" class="btn btn-accent btn-full btn-lg glow-btn-effect">
@@ -169,7 +178,7 @@
         </div>
         
         <div class="panel-content scrollbar-custom" id="history-content">
-          <div class="empty-state-text">请在左侧选择仓库和分支以查看提交历史</div>
+          <div class="empty-state-text">请在左侧选择仓库 and 分支以查看提交历史</div>
         </div>
       </section>
     </div>
@@ -205,12 +214,12 @@
   <div id="auth-modal" class="modal-overlay hidden">
     <div class="modal-card glass">
       <div class="modal-header">
-        <h3>GitHub 账户凭证配置</h3>
+        <h3>GitHub 与 AI 凭证配置</h3>
         <button class="btn-close" onclick="toggleAuthModal()">&times;</button>
       </div>
-      <div class="modal-body">
+      <div class="modal-body scrollbar-custom" style="max-height: 400px; overflow-y: auto;">
         <p class="modal-desc">
-          请提供 GitHub Personal Access Token (PAT)，用于拉取仓库和管理远程。我们只在本地保存此凭证。
+          请提供 GitHub Token 凭证以及用于生成描述的 AI 接口配置。凭证只保存在本地。
         </p>
         <div class="form-group">
           <label for="token-input">GitHub Access Token (PAT)</label>
@@ -218,8 +227,24 @@
         </div>
         <div class="token-help">
           <a href="https://github.com/settings/tokens" target="_blank" rel="noopener noreferrer">
-            <i data-lucide="external-link"></i> 去 GitHub 生成 Token (需要具有 repo 及 delete_repo 权限)
+            <i data-lucide="external-link"></i> 去 GitHub 生成 Token (需要 repo 权限)
           </a>
+        </div>
+        
+        <hr style="border: none; border-top: 1px solid var(--border-color); margin: 16px 0;" />
+        
+        <h4 style="font-family: var(--font-tech); font-size: 0.85rem; color: var(--accent-cyan); text-transform: uppercase; margin-bottom: 12px;">AI 智能提交生成配置</h4>
+        <div class="form-group">
+          <label for="ai-url-input">AI API Endpoint URL</label>
+          <input type="text" id="ai-url-input" placeholder="https://api.deepseek.com/chat/completions" />
+        </div>
+        <div class="form-group">
+          <label for="ai-key-input">AI API Key (留空将使用本地 Ollama)</label>
+          <input type="password" id="ai-key-input" placeholder="sk-xxxxxxxxxxxxxxxxxxxx" />
+        </div>
+        <div class="form-group">
+          <label for="ai-model-input">AI Model Name</label>
+          <input type="text" id="ai-model-input" placeholder="deepseek-chat" />
         </div>
       </div>
       <div class="modal-footer">
@@ -269,6 +294,25 @@
       <div class="modal-footer" id="dialog-footer">
         <button id="dialog-btn-cancel" class="btn btn-primary-outline">取消</button>
         <button id="dialog-btn-confirm" class="btn btn-danger">确认</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Diff Viewer Overlay Modal -->
+  <div id="diff-modal" class="modal-overlay hidden">
+    <div class="modal-card diff-card glass">
+      <div class="modal-header">
+        <div class="diff-title-group" style="display: flex; align-items: center; gap: 8px;">
+          <i data-lucide="file-diff" class="brand-icon"></i>
+          <h3 id="diff-filename" style="font-family: var(--font-tech); text-transform: uppercase;">文件改动对比</h3>
+        </div>
+        <div class="diff-header-actions" style="display: flex; align-items: center; gap: 12px;">
+          <button id="btn-toggle-diff-format" class="btn btn-primary-outline btn-xs">并排显示 (Side-by-Side)</button>
+          <button class="btn-close" id="btn-close-diff" style="margin-left: 8px;">&times;</button>
+        </div>
+      </div>
+      <div class="modal-body scrollbar-custom" id="diff-body" style="padding: 16px; overflow-y: auto; max-height: calc(90vh - 120px);">
+        <!-- Rendered diff html goes here -->
       </div>
     </div>
   </div>

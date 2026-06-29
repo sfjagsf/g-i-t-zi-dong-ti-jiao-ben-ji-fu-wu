@@ -309,7 +309,7 @@ app.post('/api/repo/branches', async (req, res) => {
   res.json({ success: true, branches });
 });
 
-// Fetch commit history of a branch
+// Fetch commit history of a branch with --graph
 app.post('/api/repo/history', async (req, res) => {
   const { dirPath, branch } = req.body;
   if (!dirPath || !fs.existsSync(dirPath)) {
@@ -323,7 +323,7 @@ app.post('/api/repo/history', async (req, res) => {
 
   const logRes = await runCommand(
     dirPath,
-    ['log', `origin/${branch}`, '--pretty=format:%h|%an|%ar|%s', '-n', '50'],
+    ['log', `origin/${branch}`, '--graph', '--pretty=format:%h|%an|%ar|%s', '-n', '50'],
     token
   );
 
@@ -334,8 +334,15 @@ app.post('/api/repo/history', async (req, res) => {
   const commits = logRes.stdout.split('\n')
     .filter(Boolean)
     .map(line => {
-      const [hash, author, date, message] = line.split('|');
-      return { hash, author, date, message };
+      // Matches standard graph + commit lines, e.g. "* 1a2b3c4|author|date|message" or "* | 1a2b3c4|author|date|message"
+      const match = line.match(/^([*|/\\_\s-]*)\s*([a-f0-9]{7,40})\|([^|]+)\|([^|]+)\|(.+)$/i);
+      if (match) {
+        const [, graphSymbols, hash, author, date, message] = match;
+        return { hash, author, date, message, graphSymbols };
+      } else {
+        // Line represents graph structure only (e.g. "| /")
+        return { hash: '', author: '', date: '', message: '', graphSymbols: line };
+      }
     });
 
   res.json({ success: true, commits });
@@ -403,7 +410,12 @@ app.post('/api/repo/switch', async (req, res) => {
   }
 
   if (force && hasChanges) {
-    await runCommand(dirPath, ['reset', '--hard', 'HEAD'], token);
+    const hasHeadRes = await runCommand(dirPath, ['rev-parse', '--verify', 'HEAD'], token);
+    if (hasHeadRes.success) {
+      await runCommand(dirPath, ['reset', '--hard', 'HEAD'], token);
+    } else {
+      await runCommand(dirPath, ['rm', '-rf', '--cached', '.'], token);
+    }
     await runCommand(dirPath, ['clean', '-df'], token);
   }
 
@@ -780,6 +792,174 @@ app.post('/api/fs/validate-path', (req, res) => {
     return res.json({ success: true, absolutePath: absolute });
   }
   res.json({ success: false, error: 'Directory does not exist' });
+});
+
+// Get Git Diff for a specific file (tracked or untracked)
+app.post('/api/repo/diff', async (req, res) => {
+  const { dirPath, filePath } = req.body;
+  if (!dirPath || !filePath) {
+    return res.status(400).json({ success: false, error: 'Workspace path and file path are required.' });
+  }
+
+  // Check if file is untracked
+  const statusRes = await runCommand(dirPath, ['status', '--porcelain', filePath]);
+  const statusLine = statusRes.success ? statusRes.stdout.trim() : '';
+  const isUntracked = statusLine.startsWith('??');
+
+  let diffRes;
+  if (isUntracked) {
+    const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
+    // git diff --no-index NUL filePath represents the entire untracked file as addition
+    diffRes = await runCommand(dirPath, ['diff', '--no-index', nullDevice, filePath]);
+  } else {
+    const hasHeadRes = await runCommand(dirPath, ['rev-parse', '--verify', 'HEAD']);
+    const diffBase = hasHeadRes.success ? 'HEAD' : '4b825dc642cb6eb9a0ff3e07f4618d9157b46363';
+    diffRes = await runCommand(dirPath, ['diff', diffBase, '--no-ext-diff', '--', filePath]);
+  }
+
+  res.json({
+    success: true,
+    diff: diffRes.stdout || diffRes.stderr || ''
+  });
+});
+
+// Generate AI commit message from git diff
+app.post('/api/ai/generate-commit', async (req, res) => {
+  const { dirPath } = req.body;
+  if (!dirPath || !fs.existsSync(dirPath)) {
+    return res.status(400).json({ success: false, error: 'Workspace directory does not exist.' });
+  }
+
+  const config = loadConfig();
+  let aiUrl = config.aiApiUrl ? config.aiApiUrl.trim() : 'http://localhost:11434/v1/chat/completions';
+  
+  if (aiUrl && !aiUrl.endsWith('/chat/completions')) {
+    aiUrl = aiUrl.replace(/\/+$/, '');
+    if (aiUrl.endsWith('/v1')) {
+      aiUrl += '/chat/completions';
+    } else {
+      if (aiUrl.includes('/v1')) {
+        aiUrl += '/chat/completions';
+      } else {
+        aiUrl += '/v1/chat/completions';
+      }
+    }
+  }
+
+  const aiKey = config.aiApiKey || '';
+  const aiModel = config.aiModelName || 'deepseek-chat';
+
+  // Check if HEAD exists (handling empty repositories with no initial commits)
+  const hasHeadRes = await runCommand(dirPath, ['rev-parse', '--verify', 'HEAD']);
+  const diffArgs = hasHeadRes.success
+    ? ['diff', 'HEAD', '--no-ext-diff']
+    : ['diff', '4b825dc642cb6eb9a0ff3e07f4618d9157b46363', '--no-ext-diff'];
+
+  const diffRes = await runCommand(dirPath, diffArgs);
+  const diffText = diffRes.stdout || '';
+
+  if (!diffText.trim()) {
+    // If no tracked modifications, check for untracked/unstaged changes
+    const statusRes = await runCommand(dirPath, ['status', '--porcelain']);
+    if (statusRes.stdout.trim().length === 0) {
+      return res.json({ success: false, error: '工作区完全干净，没有任何改动需要提交。' });
+    } else {
+      return res.json({ success: false, error: '检测到未追踪的全新文件，请先点击文件关联或手动输入描述。' });
+    }
+  }
+
+  // Construct chat body
+  const requestBody = {
+    model: aiModel,
+    messages: [
+      {
+        role: 'system',
+        content: '你是一个专业的 Git 助手。请根据提供的 Git diff，用中文写一行简明扼要的 Conventional Commits 格式提交说明（例如 "feat: 新增用户登录接口" 或 "fix: 修复日志轮询中的内存泄漏"）。请保持简练，仅返回最终的提交说明文本，不要包含任何 markdown 包裹（如代码块）、额外解释或引号。'
+      },
+      {
+        role: 'user',
+        content: diffText.substring(0, 20000) // limit to avoid token limits
+      }
+    ],
+    temperature: 0.2
+  };
+
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+    if (aiKey) {
+      headers['Authorization'] = `Bearer ${aiKey}`;
+    }
+
+    const response = await fetch(aiUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(requestBody)
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      return res.json({ success: false, error: `AI 服务返回错误 (${response.status}): ${errText}` });
+    }
+
+    const rawText = await response.text();
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch (e) {
+      const lastBraceIndex = rawText.lastIndexOf('}');
+      if (lastBraceIndex !== -1) {
+        try {
+          data = JSON.parse(rawText.substring(0, lastBraceIndex + 1));
+        } catch (innerErr) {
+          return res.json({ success: false, error: `解析 AI 响应失败: ${e.message}。原始响应: ${rawText}` });
+        }
+      } else {
+        return res.json({ success: false, error: `解析 AI 响应失败: ${e.message}。原始响应: ${rawText}` });
+      }
+    }
+    const aiMessage = data.choices && data.choices[0] && data.choices[0].message
+      ? data.choices[0].message.content.trim()
+      : '';
+
+    if (!aiMessage) {
+      return res.json({ success: false, error: 'AI 服务未返回有效的描述内容，请检查接口配置。' });
+    }
+
+    // Clean up typical AI wrappers if present
+    const cleanMessage = aiMessage.replace(/^["'`\s]+|["'`\s]+$/g, '');
+    res.json({ success: true, commitMessage: cleanMessage });
+  } catch (err) {
+    let errMsg = `AI 服务请求异常: ${err.message}`;
+    if (err.message && err.message.includes('fetch failed')) {
+      if (aiUrl.includes('localhost') || aiUrl.includes('127.0.0.1')) {
+        errMsg = `AI 服务请求异常 (fetch failed): 无法连接到本地 AI 服务。请确保您的 Ollama 已经在本地启动（默认端口 11434），或者在右上角「设置」中配置您使用的云端 AI 服务（例如 DeepSeek、SiliconFlow 等）的 API 地址、API Key 和模型名称。`;
+      } else {
+        errMsg = `AI 服务请求异常 (fetch failed): 无法连接到 AI 服务地址 (${aiUrl})。请检查右上角「设置」中的 API Endpoint URL 是否填写正确，并确保您的网络连接或代理设置正常。`;
+      }
+    }
+    res.json({ success: false, error: errMsg });
+  }
+});
+
+// Fetch latest GitHub Actions workflow runs for repository
+app.post('/api/github/actions/runs', async (req, res) => {
+  const config = loadConfig();
+  const token = config.githubToken;
+  if (!token) {
+    return res.json({ success: false, error: 'GitHub Token 未关联，请在设置中配置' });
+  }
+
+  const { owner, repo } = req.body;
+  if (!owner || !repo) {
+    return res.status(400).json({ success: false, error: '所有者和仓库名必填' });
+  }
+
+  const apiRes = await callGithubApi('GET', `/repos/${owner}/${repo}/actions/runs?per_page=20`, null, token);
+  if (apiRes.success) {
+    res.json({ success: true, runs: apiRes.data.workflow_runs || [] });
+  } else {
+    res.json({ success: false, error: apiRes.error });
+  }
 });
 
 // Start server

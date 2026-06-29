@@ -1,9 +1,10 @@
 // Global state
-let currentConfig = { githubToken: '', lastProjectPath: '', recentPaths: [] };
+let currentConfig = { githubToken: '', lastProjectPath: '', recentPaths: [], aiApiUrl: '', aiApiKey: '', aiModelName: '' };
 let currentRepoStatus = { isRepo: false, remoteUrl: '', currentBranch: '', hasChanges: false, changesList: [] };
 let selectedBranch = '';
 let selectedCommitHash = '';
 let logOffset = 0;
+let githubActionRuns = [];
 
 // Repository dropdown and branch list caches
 let globalReposList = [];
@@ -64,6 +65,21 @@ const dialogMessage = document.getElementById('dialog-message');
 const dialogBtnConfirm = document.getElementById('dialog-btn-confirm');
 const dialogBtnCancel = document.getElementById('dialog-btn-cancel');
 
+// AI Commit Button
+const btnAiCommit = document.getElementById('btn-ai-commit');
+const aiBtnText = document.getElementById('ai-btn-text');
+const aiBtnSpinner = document.getElementById('ai-btn-spinner');
+
+// Diff Modal Elements
+const diffModal = document.getElementById('diff-modal');
+const diffFilename = document.getElementById('diff-filename');
+const btnToggleDiffFormat = document.getElementById('btn-toggle-diff-format');
+const btnCloseDiff = document.getElementById('btn-close-diff');
+const diffBody = document.getElementById('diff-body');
+
+let currentDiffText = '';
+let currentDiffFormat = 'side-by-side'; // side-by-side or line-by-line
+
 // Custom Dialog Utility (Returns Promise)
 function showCustomDialog({ title, message, confirmText = '确认', cancelText = '取消', isDanger = false }) {
   return new Promise((resolve) => {
@@ -103,8 +119,11 @@ function showCustomDialog({ title, message, confirmText = '确认', cancelText =
 
 function toggleAuthModal() {
   authModal.classList.toggle('hidden');
-  if (!authModal.classList.contains('hidden') && currentConfig.githubToken) {
-    tokenInput.value = currentConfig.githubToken;
+  if (!authModal.classList.contains('hidden')) {
+    if (currentConfig.githubToken) tokenInput.value = currentConfig.githubToken;
+    document.getElementById('ai-url-input').value = currentConfig.aiApiUrl || '';
+    document.getElementById('ai-key-input').value = currentConfig.aiApiKey || '';
+    document.getElementById('ai-model-input').value = currentConfig.aiModelName || '';
   }
 }
 
@@ -155,6 +174,11 @@ async function loadServerConfig() {
       updateAuthUI(false);
     }
 
+    // Populate AI Settings fields
+    document.getElementById('ai-url-input').value = config.aiApiUrl || '';
+    document.getElementById('ai-key-input').value = config.aiApiKey || '';
+    document.getElementById('ai-model-input').value = config.aiModelName || '';
+
     // Populate recent paths dropdown
     populateRecentPathsDropdown(config.recentPaths || []);
     
@@ -204,7 +228,7 @@ recentPathsSelect.addEventListener('change', () => {
   const selectedPath = recentPathsSelect.value;
   if (selectedPath) {
     pathInput.value = selectedPath;
-    // Switch directory directly (no check for unsaved changes since changing active folder is harmless)
+    // Switch directory directly
     loadProjectPath(selectedPath);
   }
 });
@@ -251,6 +275,10 @@ async function fetchGithubProfile(token) {
 // Save Token Configuration
 btnSaveToken.addEventListener('click', async () => {
   const token = tokenInput.value.trim();
+  const aiUrl = document.getElementById('ai-url-input').value.trim();
+  const aiKey = document.getElementById('ai-key-input').value.trim();
+  const aiModel = document.getElementById('ai-model-input').value.trim();
+
   if (!token) {
     addSystemLog('Token 不能为空。');
     return;
@@ -259,7 +287,12 @@ btnSaveToken.addEventListener('click', async () => {
   addSystemLog('正在验证 GitHub Token...');
   const profile = await fetchGithubProfile(token);
   
-  let saveObj = { githubToken: token };
+  let saveObj = {
+    githubToken: token,
+    aiApiUrl: aiUrl,
+    aiApiKey: aiKey,
+    aiModelName: aiModel
+  };
   if (profile) {
     saveObj.username = profile.username;
     saveObj.avatarUrl = profile.avatarUrl;
@@ -324,7 +357,6 @@ function syncDropdownWithRemote(remoteUrl) {
     btnDeleteActiveRepo.classList.remove('hidden');
     loadBranchesForSelectedRepo(match);
   } else {
-    // Dropdown remains unset if remote is not in listed GitHub repos
     btnDeleteActiveRepo.classList.add('hidden');
   }
 }
@@ -383,7 +415,6 @@ async function loadBranchesForSelectedRepo(repo) {
     repoBranchesCache[repo.fullName] = res.branches;
     populateBranchesUI(repo, res.branches);
   } else {
-    // If branches are empty (usually fresh empty repo), default to main branch
     const branches = res.statusCode === 409 || res.error.includes('Git Repository is empty') ? [] : null;
     if (branches !== null) {
       populateBranchesUI(repo, ['main']);
@@ -468,13 +499,12 @@ function populateBranchesUI(repo, branches) {
   lucide.createIcons();
 }
 
-// Match remote URL (handles https, SSH, oauth tokens, etc.)
+// Match remote URL
 function isMatchingRemote(url, fullName) {
   if (!url) return false;
   const cleanUrl = url.toLowerCase();
   const target = fullName.toLowerCase();
   
-  // Strip .git suffix if present
   const stripGit = (str) => str.endsWith('.git') ? str.slice(0, -4) : str;
   const cleanTarget = stripGit(target);
   const cleanRemote = stripGit(cleanUrl);
@@ -518,7 +548,6 @@ async function bindLocalDirectoryToBranch(repo, branchName) {
     }
   }
 
-  // If NO changes, bind directly without showing any prompts/confirmations!
   addSystemLog(`正在将本地目录 [${dirPath}] 绑定至远程 [${repo.fullName}] 的 [${branchName}] 分支...`);
   const res = await apiPost('/api/repo/bind', {
     dirPath,
@@ -606,7 +635,6 @@ async function loadProjectPath(dirPath, isRetry = false) {
           // Re-populate branches list to highlight active
           loadBranchesForSelectedRepo(match);
         } else {
-          // If remote repo is not in user list, display raw remote url
           ribbonRepo.innerText = statusRes.remoteUrl;
         }
       } else {
@@ -647,7 +675,7 @@ function renderFileChanges(files) {
     const filePath = fileLine.substring(3);
 
     const item = document.createElement('div');
-    item.className = 'file-change-item';
+    item.className = 'file-change-item clickable';
 
     const info = document.createElement('div');
     info.className = 'file-info';
@@ -675,11 +703,104 @@ function renderFileChanges(files) {
     `;
 
     item.appendChild(info);
+    
+    // Bind click event to trigger visual diff modal
+    item.addEventListener('click', () => {
+      showFileDiff(filePath);
+    });
+
     fileChangesListContainer.appendChild(item);
   });
 }
 
-// Load Commit History for current branch
+// Close Diff Modal overlay
+function closeDiffModal() {
+  diffModal.classList.add('hidden');
+}
+
+document.getElementById('btn-close-diff').addEventListener('click', closeDiffModal);
+
+// Toggle between Side-by-Side and Unified Inline Diff representation
+btnToggleDiffFormat.addEventListener('click', () => {
+  if (currentDiffFormat === 'side-by-side') {
+    currentDiffFormat = 'line-by-line';
+    btnToggleDiffFormat.innerText = '切换并排显示 (Side-by-Side)';
+  } else {
+    currentDiffFormat = 'side-by-side';
+    btnToggleDiffFormat.innerText = '切换单栏显示 (Inline)';
+  }
+  renderDiffHtml();
+});
+
+// Render the loaded unified diff using diff2html
+function renderDiffHtml() {
+  if (!currentDiffText) {
+    diffBody.innerHTML = '<div class="empty-state-text">文件没有改动数据</div>';
+    return;
+  }
+
+  const html = Diff2Html.html(currentDiffText, {
+    drawFileList: false,
+    matching: 'lines',
+    outputFormat: currentDiffFormat
+  });
+
+  diffBody.innerHTML = html;
+}
+
+// Fetch and display code diff
+async function showFileDiff(filePath) {
+  const dirPath = pathInput.value.trim();
+  if (!dirPath) return;
+
+  addSystemLog(`正在读取文件 [${filePath}] 的改动差异对比...`);
+  const res = await apiPost('/api/repo/diff', { dirPath, filePath });
+
+  if (res.success) {
+    currentDiffText = res.diff;
+    diffFilename.innerText = `改动差异对比: ${filePath}`;
+    currentDiffFormat = 'side-by-side';
+    btnToggleDiffFormat.innerText = '切换单栏显示 (Inline)';
+    renderDiffHtml();
+    diffModal.classList.remove('hidden');
+  } else {
+    addSystemLog(`读取改动差异对比失败: ${res.error}`);
+  }
+}
+
+// AI Commit Generation Button click listener
+btnAiCommit.addEventListener('click', async () => {
+  const dirPath = pathInput.value.trim();
+  if (!dirPath) {
+    addSystemLog('请先链接仓库目录！');
+    return;
+  }
+  if (currentRepoStatus.changesList.length === 0) {
+    addSystemLog('当前工作区无任何改动，无法生成描述。');
+    return;
+  }
+
+  addSystemLog('正在通过 AI 生成提交描述...');
+  btnAiCommit.disabled = true;
+  aiBtnText.innerText = '正在智能生成...';
+  aiBtnSpinner.classList.remove('hidden');
+
+  const res = await apiPost('/api/ai/generate-commit', { dirPath });
+
+  btnAiCommit.disabled = false;
+  aiBtnText.innerText = '✨ AI 智能生成';
+  aiBtnSpinner.classList.add('hidden');
+
+  if (res.success) {
+    commitDescInput.value = res.commitMessage;
+    addSystemLog('AI 描述生成并填入完成！');
+  } else {
+    addSystemLog(`AI 描述生成失败: ${res.error}`);
+    alert(`生成失败: ${res.error}`);
+  }
+});
+
+// Load Commit History for current branch (integrating visual ASCII graph symbols)
 async function loadCommitHistory() {
   const dirPath = pathInput.value.trim();
   if (!dirPath || !selectedBranch) return;
@@ -700,33 +821,138 @@ async function loadCommitHistory() {
     timeline.className = 'history-timeline';
 
     commits.forEach(commit => {
-      const isSelected = commit.hash === selectedCommitHash;
+      const isSelected = commit.hash && commit.hash === selectedCommitHash;
 
       const item = document.createElement('div');
       item.className = `history-item ${isSelected ? 'selected' : ''}`;
 
-      item.innerHTML = `
-        <div class="history-meta">
-          <span class="history-hash">${commit.hash}</span>
-          <span class="history-author">${commit.author}</span>
-        </div>
-        <div class="history-msg">${commit.message}</div>
-        <div class="history-date">${commit.date}</div>
-      `;
+      const graphHtml = commit.graphSymbols 
+        ? `<span class="git-graph-track">${formatGraphSymbols(commit.graphSymbols)}</span>` 
+        : '';
 
-      item.addEventListener('click', (e) => {
-        if (e.target.closest('.history-actions-box')) return;
-        toggleCommitSelection(commit.hash);
-      });
+      if (commit.hash) {
+        item.innerHTML = `
+          <div class="history-graph-cell">${graphHtml}</div>
+          <div class="history-item-body">
+            <div class="history-meta">
+              <span class="history-hash">${commit.hash}</span>
+              <span class="history-author">${commit.author}</span>
+            </div>
+            <div class="history-msg">${commit.message}</div>
+            <div class="history-date">${commit.date}</div>
+          </div>
+        `;
+        
+        item.addEventListener('click', (e) => {
+          if (e.target.closest('.history-actions-box')) return;
+          toggleCommitSelection(commit.hash);
+        });
+      } else {
+        // Graph-only structural line
+        item.classList.add('graph-only');
+        item.innerHTML = `
+          <div class="history-graph-cell graph-only-cell">${graphHtml}</div>
+          <div class="history-item-body graph-only-body"></div>
+        `;
+      }
 
       timeline.appendChild(item);
     });
 
     historyContent.appendChild(timeline);
     lucide.createIcons();
+
+    // Trigger Actions workflow runs fetch in background
+    loadActionsRunsForRepo();
   } else {
     historyContent.innerHTML = `<div class="empty-state-text text-warning">加载历史失败: ${res.error}</div>`;
   }
+}
+
+// Highlight git graph nodes & paths colorfully
+function formatGraphSymbols(symbols) {
+  const escaped = symbols
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  return escaped
+    .replace(/([*])/g, '<span class="graph-node">$1</span>')
+    .replace(/([|])/g, '<span class="graph-line-vertical">$1</span>')
+    .replace(/([/\\_])/g, '<span class="graph-line-slash">$1</span>');
+}
+
+// Fetch GitHub Actions run status in background
+async function loadActionsRunsForRepo() {
+  if (!activeSelectedRepo || !currentConfig.githubToken) return;
+
+  const res = await apiPost('/api/github/actions/runs', {
+    owner: activeSelectedRepo.owner,
+    repo: activeSelectedRepo.name
+  });
+
+  if (res.success && Array.isArray(res.runs)) {
+    githubActionRuns = res.runs;
+    renderHistoryWithActionsStatus();
+  }
+}
+
+// Map workflow runs to commit history timeline items
+function renderHistoryWithActionsStatus() {
+  const timelineEl = historyContent.querySelector('.history-timeline');
+  if (!timelineEl) return;
+
+  const items = timelineEl.querySelectorAll('.history-item');
+  items.forEach(item => {
+    const hashSpan = item.querySelector('.history-hash');
+    if (!hashSpan) return;
+    
+    const hash = hashSpan.innerText;
+
+    const matchedRun = githubActionRuns.find(run => 
+      run.head_sha.startsWith(hash) || hash.startsWith(run.head_sha.substring(0, 7))
+    );
+
+    // Remove existing badge
+    const existingBadge = item.querySelector('.action-status-badge');
+    if (existingBadge) existingBadge.remove();
+
+    if (matchedRun) {
+      const badge = document.createElement('span');
+      badge.className = 'action-status-badge';
+      
+      let iconName = 'help-circle';
+      let tooltip = `CI Status: ${matchedRun.status}`;
+      
+      if (matchedRun.status === 'completed') {
+        if (matchedRun.conclusion === 'success') {
+          badge.className += ' success';
+          iconName = 'check-circle';
+          tooltip = 'CI 构建成功';
+        } else if (matchedRun.conclusion === 'failure') {
+          badge.className += ' failure';
+          iconName = 'x-circle';
+          tooltip = 'CI 构建失败';
+        } else {
+          badge.className += ' other';
+          iconName = 'minus-circle';
+          tooltip = `CI 结果: ${matchedRun.conclusion}`;
+        }
+      } else {
+        badge.className += ' running';
+        iconName = 'loader';
+        tooltip = 'CI 正在构建中...';
+      }
+
+      badge.innerHTML = `<i data-lucide="${iconName}" class="icon-xs" title="${tooltip}"></i>`;
+      
+      const metaRow = item.querySelector('.history-meta');
+      if (metaRow) {
+        metaRow.appendChild(badge);
+      }
+    }
+  });
+
+  lucide.createIcons();
 }
 
 // Expand action menu on a specific history item
@@ -746,6 +972,8 @@ function renderHistoryWithSelectedMenu() {
   const items = timelineEl.querySelectorAll('.history-item');
   items.forEach(item => {
     const hashSpan = item.querySelector('.history-hash');
+    if (!hashSpan) return;
+
     const hash = hashSpan.innerText;
     
     item.classList.remove('selected');
@@ -771,13 +999,17 @@ function renderHistoryWithSelectedMenu() {
       actionMenu.appendChild(btnReset);
       actionMenu.appendChild(btnBranch);
       
-      item.appendChild(actionMenu);
+      const bodyEl = item.querySelector('.history-item-body');
+      if (bodyEl) {
+        bodyEl.appendChild(actionMenu);
+      }
+      
       lucide.createIcons();
     }
   });
 }
 
-// Reset branch to commit hash (Force reset local and push force to remote)
+// Reset branch to commit hash
 async function resetToCommit(hash) {
   const dirPath = pathInput.value.trim();
   if (!dirPath || !selectedBranch) return;
@@ -823,7 +1055,6 @@ async function createBranchFromHash(hash) {
     addSystemLog(`新分支 [${cleanName}] 创建并推送成功，已自动切换至新分支`);
     selectedCommitHash = '';
     
-    // Just refresh local path and dropdown, since checkout is already handled locally by backend
     loadProjectPath(dirPath);
     if (activeSelectedRepo) {
       delete repoBranchesCache[activeSelectedRepo.fullName]; // Clear branches cache
@@ -844,7 +1075,6 @@ async function performBranchCreation(cleanName) {
   if (res.success) {
     addSystemLog(`新分支 [${cleanName}] 创建并同步远程成功，已自动切换至新分支`);
     
-    // Just refresh local path and dropdown
     loadProjectPath(dirPath);
     if (activeSelectedRepo) {
       delete repoBranchesCache[activeSelectedRepo.fullName];
@@ -1015,9 +1245,8 @@ btnConfirmCreateRepo.addEventListener('click', async () => {
   if (res.success) {
     addSystemLog(`成功创建远程仓库: ${res.repo.fullName}`);
     closeCreateRepoModal();
-    await fetchGithubRepos(); // Refresh repo tree dropdown list
+    await fetchGithubRepos();
     
-    // Auto-select the newly created repository in dropdown
     repoSelect.value = res.repo.fullName;
     repoSelect.dispatchEvent(new Event('change'));
   } else {
@@ -1057,7 +1286,6 @@ async function deleteGithubRepo(owner, repoName) {
       addSystemLog(`已成功删除远程仓库 [${fullName}]`);
       delete repoBranchesCache[fullName];
       
-      // If the currently linked repository was deleted, clear ribbon
       if (currentRepoStatus.isRepo && isMatchingRemote(currentRepoStatus.remoteUrl, fullName)) {
         activeRepoRibbon.classList.add('hidden');
         fileChangesListContainer.innerHTML = '<div class="empty-state-text">关联的远程仓库已被删除。</div>';
@@ -1081,10 +1309,9 @@ async function deleteGithubRepo(owner, repoName) {
 
 // Console terminal polling logs
 async function pollLogs() {
-  const logs = await apiGet('/api/git-logs');
-  if (logs && Array.isArray(logs) && logs.length > logOffset) {
-    const newLogs = logs.slice(logOffset);
-    newLogs.forEach(log => {
+  const res = await apiGet(`/api/git-logs?offset=${logOffset}`);
+  if (res && res.success && Array.isArray(res.logs) && res.logs.length > 0) {
+    res.logs.forEach(log => {
       const line = document.createElement('div');
       line.className = `console-line ${log.type}`;
       line.innerText = log.text;
@@ -1092,7 +1319,7 @@ async function pollLogs() {
     });
     
     consoleOutputBox.scrollTop = consoleOutputBox.scrollHeight;
-    logOffset = logs.length;
+    logOffset = res.nextOffset;
   }
 }
 
@@ -1130,6 +1357,17 @@ document.getElementById('drag-overlay').addEventListener('drop', (e) => {
       addSystemLog('检测到拖入文件。如果在浏览器中无法自动读取绝对路径，请直接将文件夹拖入顶部输入框中，或者复制粘贴该文件夹的绝对路径。');
     }
   }
+});
+
+// Modal background click close helpers
+diffModal.addEventListener('click', (e) => {
+  if (e.target === diffModal) closeDiffModal();
+});
+authModal.addEventListener('click', (e) => {
+  if (e.target === authModal) toggleAuthModal();
+});
+createRepoModal.addEventListener('click', (e) => {
+  if (e.target === createRepoModal) closeCreateRepoModal();
 });
 
 // Initialization

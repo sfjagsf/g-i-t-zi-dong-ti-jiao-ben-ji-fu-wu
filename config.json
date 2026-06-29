@@ -2,6 +2,9 @@
   "githubToken": "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",
   "username": "sfjagsf",
   "avatarUrl": "https://avatars.githubusercontent.com/u/133091399?v=4",
+  "aiApiUrl": "http://192.168.0.117:20129/v1",
+  "aiApiKey": "sk-f95271d20cf0d26d-9d3ua8-e028e51f",
+  "aiModelName": "oc/deepseek-v4-flash-free",
   "lastProjectPath": "C:\\Users\\19720\\Desktop\\提交测试",
   "recentPaths": [
     "C:\\Users\\13469\\Desktop\\github自动",
