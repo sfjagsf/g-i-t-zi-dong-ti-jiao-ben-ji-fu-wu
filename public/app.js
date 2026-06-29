@@ -634,6 +634,47 @@ async function bindLocalDirectoryToBranch(repo, branchName) {
 }
 
 // Load project path & verify repo status
+function updateLocalRepoUi(statusRes, absolutePath, { refreshBranches = true, refreshHistory = true } = {}) {
+  currentRepoStatus = statusRes;
+
+  if (statusRes.isRepo) {
+    activeRepoRibbon.classList.remove('hidden');
+    ribbonPath.innerText = absolutePath;
+    ribbonBranch.innerText = statusRes.currentBranch || 'DETACHED';
+    selectedBranch = statusRes.currentBranch;
+
+    if (globalReposList.length > 0 && statusRes.remoteUrl) {
+      const match = globalReposList.find(repo => isMatchingRemote(statusRes.remoteUrl, repo.fullName));
+      if (match) {
+        repoSelect.value = match.fullName;
+        activeSelectedRepo = match;
+        btnDeleteActiveRepo.classList.remove('hidden');
+        ribbonRepo.innerText = match.description || match.name;
+
+        if (refreshBranches) {
+          loadBranchesForSelectedRepo(match);
+        }
+      } else {
+        ribbonRepo.innerText = statusRes.remoteUrl;
+      }
+    } else {
+      ribbonRepo.innerText = statusRes.remoteUrl || '-';
+    }
+
+    renderFileChanges(statusRes.changesList);
+
+    if (refreshHistory && selectedBranch) {
+      loadCommitHistory();
+    }
+  } else {
+    activeRepoRibbon.classList.add('hidden');
+    fileChangesListContainer.innerHTML = '<div class="empty-state-text">本地文件夹尚未绑定仓库。在左侧下拉框中选择仓库并点击其分支以建立绑定。</div>';
+    changesCountBadge.innerText = 0;
+    historyContent.innerHTML = '<div class="empty-state-text">未绑定仓库，无提交历史</div>';
+    addSystemLog('检测到此目录不是 Git 仓库。请在左侧下拉框中选择仓库并点击其分支以建立绑定。');
+  }
+}
+
 async function loadProjectPath(dirPath, isRetry = false) {
   if (!dirPath) return;
   
@@ -655,8 +696,6 @@ async function loadProjectPath(dirPath, isRetry = false) {
   // Fetch status
   const statusRes = await apiPost('/api/repo/status', { dirPath: absolutePath });
   if (statusRes.success) {
-    currentRepoStatus = statusRes;
-
     // Check if we need to auto-initialize or auto-associate the selected remote repository
     if (activeSelectedRepo && !isRetry) {
       const needsInitOrBind = !statusRes.isRepo || 
@@ -678,48 +717,36 @@ async function loadProjectPath(dirPath, isRetry = false) {
         }
       }
     }
-    
-    if (statusRes.isRepo) {
-      activeRepoRibbon.classList.remove('hidden');
-      ribbonPath.innerText = absolutePath;
-      ribbonBranch.innerText = statusRes.currentBranch || 'DETACHED';
-      
-      selectedBranch = statusRes.currentBranch;
-      
-      // Auto-sync select dropdown with current remote URL
-      if (globalReposList.length > 0 && statusRes.remoteUrl) {
-        const match = globalReposList.find(repo => isMatchingRemote(statusRes.remoteUrl, repo.fullName));
-        if (match) {
-          repoSelect.value = match.fullName;
-          activeSelectedRepo = match;
-          btnDeleteActiveRepo.classList.remove('hidden');
-          ribbonRepo.innerText = match.description || match.name; // Display Chinese name
-          
-          // Re-populate branches list to highlight active
-          loadBranchesForSelectedRepo(match);
-        } else {
-          ribbonRepo.innerText = statusRes.remoteUrl;
-        }
-      } else {
-        ribbonRepo.innerText = statusRes.remoteUrl || '-';
-      }
-      
-      // Update File changes list
-      renderFileChanges(statusRes.changesList);
-      
-      // Fetch commit history
-      if (selectedBranch) {
-        loadCommitHistory();
-      }
-    } else {
-      activeRepoRibbon.classList.add('hidden');
-      fileChangesListContainer.innerHTML = '<div class="empty-state-text">本地文件夹尚未绑定仓库。在左侧下拉框中选择仓库并点击其分支以建立绑定。</div>';
-      changesCountBadge.innerText = 0;
-      historyContent.innerHTML = '<div class="empty-state-text">未绑定仓库，无提交历史</div>';
-      addSystemLog('检测到此目录不是 Git 仓库。请在左侧下拉框中选择仓库并点击其分支以建立绑定。');
-    }
+
+    updateLocalRepoUi(statusRes, absolutePath);
   } else {
     addSystemLog(`加载仓库状态出错: ${statusRes.error}`);
+  }
+}
+
+async function refreshLocalChanges() {
+  const dirPath = pathInput.value.trim();
+  if (!dirPath) return;
+
+  addSystemLog('正在手动扫描工作区改动...');
+  const checkPath = await apiPost('/api/fs/validate-path', { dirPath });
+  if (!checkPath.success) {
+    addSystemLog(`路径无效: ${checkPath.error}`);
+    return;
+  }
+
+  const absolutePath = checkPath.absolutePath;
+  pathInput.value = absolutePath;
+
+  const statusRes = await apiPost('/api/repo/status', { dirPath: absolutePath });
+  if (statusRes.success) {
+    updateLocalRepoUi(statusRes, absolutePath, {
+      refreshBranches: false,
+      refreshHistory: false
+    });
+    addSystemLog('本地改动刷新完成。');
+  } else {
+    addSystemLog(`刷新本地改动失败: ${statusRes.error}`);
   }
 }
 
@@ -1208,11 +1235,7 @@ btnRibbonCreateBranch.addEventListener('click', async () => {
 
 // Manual refresh local changes button click
 btnRefreshChanges.addEventListener('click', () => {
-  const dirPath = pathInput.value.trim();
-  if (dirPath) {
-    addSystemLog('正在手动扫描工作区改动...');
-    loadProjectPath(dirPath);
-  }
+  refreshLocalChanges();
 });
 
 // Commit and force push button
@@ -1254,7 +1277,7 @@ btnCommitPush.addEventListener('click', async () => {
   if (res.success) {
     addSystemLog(`成功提交并强推至 [${selectedBranch}]`);
     commitDescInput.value = '';
-    loadProjectPath(dirPath);
+    refreshLocalChanges();
   } else {
     addSystemLog(`提交失败: ${res.error}`);
   }
