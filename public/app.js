@@ -478,7 +478,8 @@ async function loadBranchesForSelectedRepo(repo) {
     repoBranchesCache[repo.fullName] = res.branches;
     populateBranchesUI(repo, res.branches);
   } else {
-    const branches = res.statusCode === 409 || res.error.includes('Git Repository is empty') ? [] : null;
+    const errorText = res.error || '';
+    const branches = res.statusCode === 409 || errorText.includes('Git Repository is empty') ? [] : null;
     if (branches !== null) {
       populateBranchesUI(repo, ['main']);
     } else {

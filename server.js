@@ -96,6 +96,62 @@ function isSafeRelativePathspec(filePath) {
   return !filePath.split(/[\\/]+/).includes('..');
 }
 
+function normalizeRemoteUrl(remoteUrl) {
+  if (typeof remoteUrl !== 'string' || !remoteUrl.trim()) return '';
+  let cleanRemoteUrl = remoteUrl.trim();
+  while (cleanRemoteUrl.endsWith('/')) {
+    cleanRemoteUrl = cleanRemoteUrl.slice(0, -1);
+  }
+  if (!cleanRemoteUrl.endsWith('.git')) {
+    cleanRemoteUrl += '.git';
+  }
+  return cleanRemoteUrl;
+}
+
+async function isGitRepository(cwd, token = '') {
+  const result = await runCommand(cwd, ['rev-parse', '--is-inside-work-tree'], token);
+  return result.success && result.stdout.trim() === 'true';
+}
+
+function remoteListHasOrigin(remoteOutput) {
+  return remoteOutput.split('\n').map(remote => remote.trim()).includes('origin');
+}
+
+async function localBranchExists(cwd, branch, token = '') {
+  const result = await runCommand(cwd, ['show-ref', '--verify', `refs/heads/${branch}`], token);
+  return result.success;
+}
+
+async function remoteBranchExists(cwd, branch, token = '') {
+  const result = await runCommand(cwd, ['show-ref', '--verify', `refs/remotes/origin/${branch}`], token);
+  return result.success;
+}
+
+async function checkoutBranchPreservingLocal(cwd, branch, token = '') {
+  if (await localBranchExists(cwd, branch, token)) {
+    return runCommand(cwd, ['checkout', branch], token);
+  }
+
+  if (await remoteBranchExists(cwd, branch, token)) {
+    return runCommand(cwd, ['checkout', '--track', '-b', branch, `origin/${branch}`], token);
+  }
+
+  return { success: false, error: 'Branch not found locally or on origin.' };
+}
+
+async function checkoutOrCreateLocalBranch(cwd, branch, token = '') {
+  if (await localBranchExists(cwd, branch, token)) {
+    return runCommand(cwd, ['checkout', branch], token);
+  }
+
+  const hasHeadRes = await runCommand(cwd, ['rev-parse', '--verify', 'HEAD'], token);
+  if (hasHeadRes.success) {
+    return runCommand(cwd, ['checkout', '-b', branch], token);
+  }
+
+  return runCommand(cwd, ['symbolic-ref', 'HEAD', `refs/heads/${branch}`], token);
+}
+
 async function validateBranchName(cwd, branch, token = '') {
   if (typeof branch !== 'string' || !branch.trim() || branch !== branch.trim() || branch.startsWith('-')) {
     return { success: false, error: 'Invalid branch name.' };
@@ -118,8 +174,39 @@ async function validateCommitRef(cwd, ref, token = '') {
   return { success: true };
 }
 
+async function getDiffIncludingUntracked(cwd, token = '') {
+  const hasHeadRes = await runCommand(cwd, ['rev-parse', '--verify', 'HEAD'], token);
+  const diffArgs = hasHeadRes.success
+    ? ['diff', 'HEAD', '--no-ext-diff']
+    : ['diff', '4b825dc642cb6eb9a0ff3e07f4618d9157b46363', '--no-ext-diff'];
+
+  const diffRes = await runCommand(cwd, diffArgs, token);
+  const diffParts = [];
+  if (diffRes.stdout) {
+    diffParts.push(diffRes.stdout);
+  }
+
+  const untrackedRes = await runCommand(cwd, ['ls-files', '--others', '--exclude-standard', '-z'], token, { trimOutput: false });
+  const untrackedFiles = untrackedRes.success
+    ? untrackedRes.stdout.split('\0').filter(Boolean)
+    : [];
+
+  const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
+  for (const file of untrackedFiles) {
+    if (!isSafeRelativePathspec(file)) continue;
+    const fileDiffRes = await runCommand(cwd, ['diff', '--no-index', '--', nullDevice, file], token);
+    const fileDiff = fileDiffRes.stdout || fileDiffRes.stderr || '';
+    if (fileDiff) {
+      diffParts.push(fileDiff);
+    }
+    if (diffParts.join('\n').length >= 20000) break;
+  }
+
+  return diffParts.join('\n');
+}
+
 // Helper to run shell commands in cwd safely
-function runCommand(cwd, args, token = '') {
+function runCommand(cwd, args, token = '', options = {}) {
   return new Promise((resolve) => {
     const timestamp = new Date().toLocaleTimeString();
     
@@ -148,10 +235,12 @@ function runCommand(cwd, args, token = '') {
       cwd,
       env: buildGitEnv(token),
       maxBuffer: 1024 * 1024 * 10,
+      timeout: 60000,
       encoding: 'utf8'
     }, (error, stdout, stderr) => {
-      const outText = stdout ? stdout.trim() : '';
-      const errText = stderr ? stderr.trim() : '';
+      const trimOutput = options.trimOutput !== false;
+      const outText = stdout ? (trimOutput ? stdout.trim() : stdout) : '';
+      const errText = stderr ? (trimOutput ? stderr.trim() : stderr) : '';
       
       const maskedOut = maskToken(outText, token);
       const maskedErr = maskToken(errText, token);
@@ -297,18 +386,15 @@ app.post('/api/repo/status', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Directory does not exist.' });
   }
 
-  // Check if .git folder exists
-  const gitDir = path.join(safeDir, '.git');
-  const isRepo = fs.existsSync(gitDir) && fs.lstatSync(gitDir).isDirectory();
+  const config = loadConfig();
+  const token = config.githubToken || '';
+  const isRepo = await isGitRepository(safeDir, token);
 
   if (!isRepo) {
     return res.json({ success: true, isRepo: false });
   }
 
   // Get current remote URL
-  const config = loadConfig();
-  const token = config.githubToken || '';
-  
   const remoteResult = await runCommand(safeDir, ['remote', 'get-url', 'origin'], token);
   let remoteUrl = '';
   if (remoteResult.success) {
@@ -352,17 +438,9 @@ app.post('/api/repo/init', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Remote URL is required.' });
   }
 
-  // Clean remoteUrl by removing trailing slashes and adding .git suffix if missing
-  let cleanRemoteUrl = remoteUrl.trim();
-  while (cleanRemoteUrl.endsWith('/')) {
-    cleanRemoteUrl = cleanRemoteUrl.slice(0, -1);
-  }
-  if (!cleanRemoteUrl.endsWith('.git')) {
-    cleanRemoteUrl += '.git';
-  }
+  const cleanRemoteUrl = normalizeRemoteUrl(remoteUrl);
 
-  const gitDir = path.join(safeDir, '.git');
-  const isRepo = fs.existsSync(gitDir);
+  const isRepo = await isGitRepository(safeDir, token);
 
   if (!isRepo) {
     const initRes = await runCommand(safeDir, ['init'], token);
@@ -373,7 +451,7 @@ app.post('/api/repo/init', async (req, res) => {
 
   const checkRemote = await runCommand(safeDir, ['remote'], token);
   let setRemoteRes;
-  if (checkRemote.stdout.includes('origin')) {
+  if (remoteListHasOrigin(checkRemote.stdout)) {
     setRemoteRes = await runCommand(safeDir, ['remote', 'set-url', 'origin', cleanRemoteUrl], token);
   } else {
     setRemoteRes = await runCommand(safeDir, ['remote', 'add', 'origin', cleanRemoteUrl], token);
@@ -490,9 +568,12 @@ app.post('/api/repo/commit', async (req, res) => {
     return res.status(400).json({ success: false, error: branchValidation.error });
   }
 
-  const checkBranch = await runCommand(safeDir, ['checkout', '-B', branch], token);
-  if (!checkBranch.success) {
-    await runCommand(safeDir, ['checkout', branch], token);
+  const currentBranchRes = await runCommand(safeDir, ['branch', '--show-current'], token);
+  if (currentBranchRes.success && currentBranchRes.stdout.trim() && currentBranchRes.stdout.trim() !== branch) {
+    const checkoutRes = await runCommand(safeDir, ['checkout', branch], token);
+    if (!checkoutRes.success) {
+      return res.json({ success: false, error: 'Failed to checkout target branch: ' + checkoutRes.error });
+    }
   }
 
   const addRes = await runCommand(safeDir, ['add', '-A'], token);
@@ -555,12 +636,9 @@ app.post('/api/repo/switch', async (req, res) => {
 
   await runCommand(safeDir, ['fetch', 'origin', branch], token);
 
-  const checkoutRes = await runCommand(safeDir, ['checkout', '-B', branch, `origin/${branch}`], token);
+  const checkoutRes = await checkoutBranchPreservingLocal(safeDir, branch, token);
   if (!checkoutRes.success) {
-    const checkoutLocalRes = await runCommand(safeDir, ['checkout', '-B', branch], token);
-    if (!checkoutLocalRes.success) {
-      return res.json({ success: false, error: 'Failed to switch branch: ' + checkoutRes.error });
-    }
+    return res.json({ success: false, error: 'Failed to switch branch: ' + checkoutRes.error });
   }
 
   res.json({ success: true });
@@ -661,7 +739,12 @@ app.post('/api/repo/delete-branch', async (req, res) => {
       .find(b => b && b !== branchToDelete && !b.includes('HEAD'));
     
     if (alternative) {
-      await runCommand(safeDir, ['checkout', alternative], token);
+      const checkoutAlternativeRes = await runCommand(safeDir, ['checkout', alternative], token);
+      if (!checkoutAlternativeRes.success) {
+        return res.json({ success: false, error: 'Failed to switch away from branch before deletion: ' + checkoutAlternativeRes.error });
+      }
+    } else {
+      return res.json({ success: false, error: 'Cannot delete the currently checked out branch because no alternative branch exists.' });
     }
   }
 
@@ -670,7 +753,10 @@ app.post('/api/repo/delete-branch', async (req, res) => {
     return res.json({ success: false, error: 'Failed to delete remote branch: ' + deleteRemoteRes.error });
   }
 
-  await runCommand(safeDir, ['branch', '-D', branchToDelete], token);
+  const deleteLocalRes = await runCommand(safeDir, ['branch', '-D', branchToDelete], token);
+  if (!deleteLocalRes.success && !deleteLocalRes.stderr.includes('not found')) {
+    return res.json({ success: false, error: 'Failed to delete local branch after remote deletion: ' + deleteLocalRes.error });
+  }
   res.json({ success: true });
 });
 
@@ -846,7 +932,7 @@ app.post('/api/github/repos/branches', async (req, res) => {
     const branches = apiRes.data.map(b => b.name);
     res.json({ success: true, branches });
   } else {
-    res.json({ success: false, error: apiRes.error });
+    res.json({ success: false, statusCode: apiRes.statusCode, error: apiRes.error });
   }
 });
 
@@ -868,17 +954,9 @@ app.post('/api/repo/bind', async (req, res) => {
     return res.status(400).json({ success: false, error: branchValidation.error });
   }
 
-  // Clean remoteUrl by removing trailing slashes and adding .git suffix if missing
-  let cleanRemoteUrl = remoteUrl.trim();
-  while (cleanRemoteUrl.endsWith('/')) {
-    cleanRemoteUrl = cleanRemoteUrl.slice(0, -1);
-  }
-  if (!cleanRemoteUrl.endsWith('.git')) {
-    cleanRemoteUrl += '.git';
-  }
+  const cleanRemoteUrl = normalizeRemoteUrl(remoteUrl);
 
-  const gitDir = path.join(safeDir, '.git');
-  const isRepo = fs.existsSync(gitDir) && fs.lstatSync(gitDir).isDirectory();
+  const isRepo = await isGitRepository(safeDir, token);
 
   // 1. If not a repo, init it
   if (!isRepo) {
@@ -895,7 +973,7 @@ app.post('/api/repo/bind', async (req, res) => {
   // 2. Set/update remote URL
   const checkRemote = await runCommand(safeDir, ['remote'], token);
   let setRemoteRes;
-  if (checkRemote.stdout.includes('origin')) {
+  if (remoteListHasOrigin(checkRemote.stdout)) {
     setRemoteRes = await runCommand(safeDir, ['remote', 'set-url', 'origin', cleanRemoteUrl], token);
   } else {
     setRemoteRes = await runCommand(safeDir, ['remote', 'add', 'origin', cleanRemoteUrl], token);
@@ -909,17 +987,19 @@ app.post('/api/repo/bind', async (req, res) => {
   const fetchRes = await runCommand(safeDir, ['fetch', 'origin', branch], token);
 
   // 4. Try checking out the target branch
-  if (fetchRes.success) {
-    // Branch exists remotely. Checkout to it.
-    const checkoutRes = await runCommand(safeDir, ['checkout', '-B', branch, `origin/${branch}`], token);
+  if (fetchRes.success && await remoteBranchExists(safeDir, branch, token)) {
+    // Branch exists remotely. Checkout to it without resetting an existing local branch.
+    const checkoutRes = await checkoutBranchPreservingLocal(safeDir, branch, token);
     if (!checkoutRes.success) {
       return res.json({ success: false, error: '切换分支失败: ' + checkoutRes.error });
     }
+  } else if (!fetchRes.success && !fetchRes.error.includes('couldn\'t find remote ref')) {
+    return res.json({ success: false, error: '拉取远程分支失败: ' + fetchRes.error });
   } else {
     // Branch does NOT exist remotely. Let's create it locally and push to remote.
     // Check if we already have files in the folder. If so, stage & commit them.
     // If not, commit an empty commit.
-    const checkoutNewRes = await runCommand(safeDir, ['checkout', '-B', branch], token);
+    const checkoutNewRes = await checkoutOrCreateLocalBranch(safeDir, branch, token);
     if (!checkoutNewRes.success) {
       return res.json({ success: false, error: '本地新建分支失败: ' + checkoutNewRes.error });
     }
@@ -1005,14 +1085,7 @@ app.post('/api/ai/generate-commit', async (req, res) => {
   const aiKey = config.aiApiKey || '';
   const aiModel = config.aiModelName || 'deepseek-chat';
 
-  // Check if HEAD exists (handling empty repositories with no initial commits)
-  const hasHeadRes = await runCommand(safeDir, ['rev-parse', '--verify', 'HEAD']);
-  const diffArgs = hasHeadRes.success
-    ? ['diff', 'HEAD', '--no-ext-diff']
-    : ['diff', '4b825dc642cb6eb9a0ff3e07f4618d9157b46363', '--no-ext-diff'];
-
-  const diffRes = await runCommand(safeDir, diffArgs);
-  const diffText = diffRes.stdout || '';
+  const diffText = await getDiffIncludingUntracked(safeDir);
 
   if (!diffText.trim()) {
     // If no tracked modifications, check for untracked/unstaged changes
@@ -1020,7 +1093,7 @@ app.post('/api/ai/generate-commit', async (req, res) => {
     if (statusRes.stdout.trim().length === 0) {
       return res.json({ success: false, error: '工作区完全干净，没有任何改动需要提交。' });
     } else {
-      return res.json({ success: false, error: '检测到未追踪的全新文件，请先点击文件关联或手动输入描述。' });
+      return res.json({ success: false, error: '检测到改动，但未能生成有效 diff。请手动输入描述。' });
     }
   }
 
