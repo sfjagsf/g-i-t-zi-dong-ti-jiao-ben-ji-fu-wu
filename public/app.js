@@ -152,6 +152,50 @@ function addSystemLog(text) {
   consoleOutputBox.scrollTop = consoleOutputBox.scrollHeight;
 }
 
+function appendIcon(parent, name, className = '') {
+  const icon = document.createElement('i');
+  icon.setAttribute('data-lucide', name);
+  if (className) icon.className = className;
+  parent.appendChild(icon);
+  return icon;
+}
+
+function setTextState(container, text, extraClass = '') {
+  container.replaceChildren();
+  const state = document.createElement('div');
+  state.className = `empty-state-text${extraClass ? ` ${extraClass}` : ''}`;
+  state.innerText = text;
+  container.appendChild(state);
+}
+
+function setSelectMessage(select, text) {
+  select.replaceChildren();
+  const option = document.createElement('option');
+  option.value = '';
+  option.innerText = text;
+  select.appendChild(option);
+}
+
+function createGraphTrack(symbols) {
+  const track = document.createElement('span');
+  track.className = 'git-graph-track';
+
+  Array.from(symbols).forEach(char => {
+    const span = document.createElement('span');
+    span.innerText = char;
+    if (char === '*') {
+      span.className = 'graph-node';
+    } else if (char === '|') {
+      span.className = 'graph-line-vertical';
+    } else if (char === '/' || char === '\\' || char === '_') {
+      span.className = 'graph-line-slash';
+    }
+    track.appendChild(span);
+  });
+
+  return track;
+}
+
 // API Call Wrappers
 async function apiPost(url, data = {}) {
   try {
@@ -333,14 +377,14 @@ btnSaveToken.addEventListener('click', async () => {
 async function fetchGithubRepos() {
   if (!currentConfig.hasGithubToken) return;
   
-  repoSelect.innerHTML = '<option value="">正在读取仓库列表...</option>';
+  setSelectMessage(repoSelect, '正在读取仓库列表...');
   
   const res = await apiGet('/api/github/repos');
   if (res.success) {
     globalReposList = res.repos;
     populateRepoDropdown(res.repos);
   } else {
-    repoSelect.innerHTML = `<option value="">加载仓库失败: ${res.error}</option>`;
+    setSelectMessage(repoSelect, `加载仓库失败: ${res.error}`);
   }
 }
 
@@ -438,7 +482,7 @@ async function loadBranchesForSelectedRepo(repo) {
     if (branches !== null) {
       populateBranchesUI(repo, ['main']);
     } else {
-      branchesListContainer.innerHTML = `<div class="empty-state-text text-warning">加载分支失败: ${res.error}</div>`;
+      setTextState(branchesListContainer, `加载分支失败: ${res.error}`, 'text-warning');
     }
   }
 }
@@ -462,10 +506,10 @@ function populateBranchesUI(repo, branches) {
 
     const nameWrap = document.createElement('div');
     nameWrap.className = 'branch-name-wrap';
-    nameWrap.innerHTML = `
-      <i data-lucide="git-branch" class="icon-xs"></i>
-      <span>${branch}</span>
-    `;
+    appendIcon(nameWrap, 'git-branch', 'icon-xs');
+    const branchNameSpan = document.createElement('span');
+    branchNameSpan.innerText = branch;
+    nameWrap.appendChild(branchNameSpan);
 
     item.appendChild(nameWrap);
 
@@ -716,10 +760,17 @@ function renderFileChanges(files) {
       badgeText = 'NEW';
     }
 
-    info.innerHTML = `
-      <span class="file-status-badge ${badgeClass}">${badgeText}</span>
-      <span class="file-name" title="${filePath}">${filePath}</span>
-    `;
+    const badge = document.createElement('span');
+    badge.className = `file-status-badge ${badgeClass}`;
+    badge.innerText = badgeText;
+
+    const fileName = document.createElement('span');
+    fileName.className = 'file-name';
+    fileName.title = filePath;
+    fileName.innerText = filePath;
+
+    info.appendChild(badge);
+    info.appendChild(fileName);
 
     item.appendChild(info);
     
@@ -845,22 +896,42 @@ async function loadCommitHistory() {
       const item = document.createElement('div');
       item.className = `history-item ${isSelected ? 'selected' : ''}`;
 
-      const graphHtml = commit.graphSymbols 
-        ? `<span class="git-graph-track">${formatGraphSymbols(commit.graphSymbols)}</span>` 
-        : '';
-
       if (commit.hash) {
-        item.innerHTML = `
-          <div class="history-graph-cell">${graphHtml}</div>
-          <div class="history-item-body">
-            <div class="history-meta">
-              <span class="history-hash">${commit.hash}</span>
-              <span class="history-author">${commit.author}</span>
-            </div>
-            <div class="history-msg">${commit.message}</div>
-            <div class="history-date">${commit.date}</div>
-          </div>
-        `;
+        const graphCell = document.createElement('div');
+        graphCell.className = 'history-graph-cell';
+        if (commit.graphSymbols) {
+          graphCell.appendChild(createGraphTrack(commit.graphSymbols));
+        }
+
+        const body = document.createElement('div');
+        body.className = 'history-item-body';
+
+        const meta = document.createElement('div');
+        meta.className = 'history-meta';
+
+        const hash = document.createElement('span');
+        hash.className = 'history-hash';
+        hash.innerText = commit.hash;
+
+        const author = document.createElement('span');
+        author.className = 'history-author';
+        author.innerText = commit.author;
+
+        const message = document.createElement('div');
+        message.className = 'history-msg';
+        message.innerText = commit.message;
+
+        const date = document.createElement('div');
+        date.className = 'history-date';
+        date.innerText = commit.date;
+
+        meta.appendChild(hash);
+        meta.appendChild(author);
+        body.appendChild(meta);
+        body.appendChild(message);
+        body.appendChild(date);
+        item.appendChild(graphCell);
+        item.appendChild(body);
         
         item.addEventListener('click', (e) => {
           if (e.target.closest('.history-actions-box')) return;
@@ -869,10 +940,15 @@ async function loadCommitHistory() {
       } else {
         // Graph-only structural line
         item.classList.add('graph-only');
-        item.innerHTML = `
-          <div class="history-graph-cell graph-only-cell">${graphHtml}</div>
-          <div class="history-item-body graph-only-body"></div>
-        `;
+        const graphCell = document.createElement('div');
+        graphCell.className = 'history-graph-cell graph-only-cell';
+        if (commit.graphSymbols) {
+          graphCell.appendChild(createGraphTrack(commit.graphSymbols));
+        }
+        const body = document.createElement('div');
+        body.className = 'history-item-body graph-only-body';
+        item.appendChild(graphCell);
+        item.appendChild(body);
       }
 
       timeline.appendChild(item);
@@ -884,20 +960,8 @@ async function loadCommitHistory() {
     // Trigger Actions workflow runs fetch in background
     loadActionsRunsForRepo();
   } else {
-    historyContent.innerHTML = `<div class="empty-state-text text-warning">加载历史失败: ${res.error}</div>`;
+    setTextState(historyContent, `加载历史失败: ${res.error}`, 'text-warning');
   }
-}
-
-// Highlight git graph nodes & paths colorfully
-function formatGraphSymbols(symbols) {
-  const escaped = symbols
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-  return escaped
-    .replace(/([*])/g, '<span class="graph-node">$1</span>')
-    .replace(/([|])/g, '<span class="graph-line-vertical">$1</span>')
-    .replace(/([/\\_])/g, '<span class="graph-line-slash">$1</span>');
 }
 
 // Fetch GitHub Actions run status in background
@@ -962,7 +1026,8 @@ function renderHistoryWithActionsStatus() {
         tooltip = 'CI 正在构建中...';
       }
 
-      badge.innerHTML = `<i data-lucide="${iconName}" class="icon-xs" title="${tooltip}"></i>`;
+      const icon = appendIcon(badge, iconName, 'icon-xs');
+      icon.title = tooltip;
       
       const metaRow = item.querySelector('.history-meta');
       if (metaRow) {
