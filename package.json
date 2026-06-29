@@ -4,7 +4,8 @@
   "description": "Codex-style GitHub automatic workflow tool",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js && node --check public/app.js"
   },
   "dependencies": {
     "express": "^4.19.2",
