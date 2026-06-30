@@ -63,6 +63,17 @@ function maskToken(str, token) {
   return masked;
 }
 
+function maskSensitiveLog(str, token = '') {
+  if (!str) return '';
+  let masked = maskToken(str, token);
+  masked = masked.replace(/\bghp_[A-Za-z0-9_]{20,}\b/g, 'ghp_******');
+  masked = masked.replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, 'github_pat_******');
+  masked = masked.replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, 'sk-******');
+  masked = masked.replace(/(BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY)[\s\S]*?(END (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY)/g, '$1 ****** $2');
+  masked = masked.replace(/\b(apiKey|api_key|aiApiKey|githubToken|token|password|secret)\b(["']?\s*[:=]\s*["'])([^"'\s,;]{12,})(["'])/gi, '$1$2******$4');
+  return masked;
+}
+
 function buildGitEnv(token = '') {
   const env = {
     ...process.env,
@@ -208,13 +219,17 @@ async function validateCommitRef(cwd, ref, token = '') {
   return { success: true };
 }
 
-async function getDiffIncludingUntracked(cwd, token = '') {
+async function getDiffIncludingUntracked(cwd, token = '', maxChars = 20000, options = {}) {
+  const diffCommandOptions = {
+    logOutput: false,
+    ...options
+  };
   const hasHeadRes = await runCommand(cwd, ['rev-parse', '--verify', 'HEAD'], token);
   const diffArgs = hasHeadRes.success
     ? ['diff', 'HEAD', '--no-ext-diff']
     : ['diff', '4b825dc642cb6eb9a0ff3e07f4618d9157b46363', '--no-ext-diff'];
 
-  const diffRes = await runCommand(cwd, diffArgs, token);
+  const diffRes = await runCommand(cwd, diffArgs, token, diffCommandOptions);
   const diffParts = [];
   if (diffRes.stdout) {
     diffParts.push(diffRes.stdout);
@@ -228,47 +243,54 @@ async function getDiffIncludingUntracked(cwd, token = '') {
   const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
   for (const file of untrackedFiles) {
     if (!isSafeRelativePathspec(file)) continue;
-    const fileDiffRes = await runCommand(cwd, ['diff', '--no-index', '--', nullDevice, file], token);
+    const fileDiffRes = await runCommand(cwd, ['diff', '--no-index', '--', nullDevice, file], token, diffCommandOptions);
     const fileDiff = fileDiffRes.stdout || fileDiffRes.stderr || '';
     if (fileDiff) {
       diffParts.push(fileDiff);
     }
-    if (diffParts.join('\n').length >= 20000) break;
+    if (diffParts.join('\n').length >= maxChars) break;
   }
 
-  return diffParts.join('\n');
+  const combinedDiff = diffParts.join('\n');
+  return combinedDiff.length > maxChars ? combinedDiff.slice(0, maxChars) : combinedDiff;
 }
 
 // Helper to run shell commands in cwd safely
 function runCommand(cwd, args, token = '', options = {}) {
   return new Promise((resolve) => {
     const timestamp = new Date().toLocaleTimeString();
+    const logCommand = options.logCommand !== false;
+    const logOutput = options.logOutput !== false;
+    const returnRawOutput = options.returnRawOutput === true;
     
     // Format command line for logging
     const commandLine = 'git ' + args.map(arg => {
-      if (arg.includes(' ') || arg.includes('"') || arg.includes("'")) {
-        return `"${arg.replace(/"/g, '\\"')}"`;
+      const value = String(arg);
+      if (value.includes(' ') || value.includes('"') || value.includes("'")) {
+        return `"${value.replace(/"/g, '\\"')}"`;
       }
-      return arg;
+      return value;
     }).join(' ');
 
-    const cmdForLog = maskToken(commandLine, token);
+    const cmdForLog = maskSensitiveLog(commandLine, token);
     
-    gitCommandLogs.push({
-      type: 'command',
-      text: `$ ${cmdForLog}`,
-      timestamp
-    });
+    if (logCommand) {
+      gitCommandLogs.push({
+        type: 'command',
+        text: `$ ${cmdForLog}`,
+        timestamp
+      });
 
-    // Cap in-memory logs to prevent memory leaks (Max 500 entries)
-    if (gitCommandLogs.length > 500) {
-      gitCommandLogs.shift();
+      // Cap in-memory logs to prevent memory leaks (Max 500 entries)
+      if (gitCommandLogs.length > 500) {
+        gitCommandLogs.shift();
+      }
     }
 
     execFile('git', args, {
       cwd,
       env: buildGitEnv(token),
-      maxBuffer: 1024 * 1024 * 10,
+      maxBuffer: options.maxBuffer || 1024 * 1024 * 10,
       timeout: 60000,
       encoding: 'utf8'
     }, (error, stdout, stderr) => {
@@ -276,30 +298,33 @@ function runCommand(cwd, args, token = '', options = {}) {
       const outText = stdout ? (trimOutput ? stdout.trim() : stdout) : '';
       const errText = stderr ? (trimOutput ? stderr.trim() : stderr) : '';
       
-      const maskedOut = maskToken(outText, token);
-      const maskedErr = maskToken(errText, token);
+      const maskedOut = maskSensitiveLog(outText, token);
+      const maskedErr = maskSensitiveLog(errText, token);
 
-      if (maskedOut) {
+      if (logOutput && maskedOut) {
         gitCommandLogs.push({ type: 'stdout', text: maskedOut, timestamp });
         if (gitCommandLogs.length > 500) gitCommandLogs.shift();
       }
-      if (maskedErr) {
+      if (logOutput && maskedErr) {
         gitCommandLogs.push({ type: 'stderr', text: maskedErr, timestamp });
         if (gitCommandLogs.length > 500) gitCommandLogs.shift();
       }
+
+      const returnedStdout = returnRawOutput ? outText : maskedOut;
+      const returnedStderr = returnRawOutput ? errText : maskedErr;
 
       if (error) {
         resolve({
           success: false,
           error: error.message,
-          stdout: maskedOut,
-          stderr: maskedErr
+          stdout: returnedStdout,
+          stderr: returnedStderr
         });
       } else {
         resolve({
           success: true,
-          stdout: maskedOut,
-          stderr: maskedErr
+          stdout: returnedStdout,
+          stderr: returnedStderr
         });
       }
     });
@@ -593,7 +618,7 @@ app.post('/api/repo/commit', async (req, res) => {
   if (!branch) {
     return res.status(400).json({ success: false, error: 'Branch is required.' });
   }
-  if (!description) {
+  if (typeof description !== 'string' || !description.trim()) {
     return res.status(400).json({ success: false, error: 'Commit description is required.' });
   }
 
@@ -603,11 +628,11 @@ app.post('/api/repo/commit', async (req, res) => {
   }
 
   const currentBranchRes = await runCommand(safeDir, ['branch', '--show-current'], token);
-  if (currentBranchRes.success && currentBranchRes.stdout.trim() && currentBranchRes.stdout.trim() !== branch) {
-    const checkoutRes = await runCommand(safeDir, ['checkout', branch], token);
-    if (!checkoutRes.success) {
-      return res.json({ success: false, error: 'Failed to checkout target branch: ' + checkoutRes.error });
-    }
+  if (!currentBranchRes.success || !currentBranchRes.stdout.trim()) {
+    return res.json({ success: false, error: '无法确认当前分支，请刷新仓库状态后重试。' });
+  }
+  if (currentBranchRes.stdout.trim() !== branch) {
+    return res.json({ success: false, error: `当前工作区分支是 [${currentBranchRes.stdout.trim()}]，不是页面选中的 [${branch}]。请刷新后重试。` });
   }
 
   const addRes = await runCommand(safeDir, ['add', '-A'], token);
@@ -1100,11 +1125,11 @@ app.post('/api/repo/diff', async (req, res) => {
   if (isUntracked) {
     const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
     // git diff --no-index NUL filePath represents the entire untracked file as addition
-    diffRes = await runCommand(safeDir, ['diff', '--no-index', '--', nullDevice, filePath], token);
+    diffRes = await runCommand(safeDir, ['diff', '--no-index', '--', nullDevice, filePath], token, { logOutput: false });
   } else {
     const hasHeadRes = await runCommand(safeDir, ['rev-parse', '--verify', 'HEAD'], token);
     const diffBase = hasHeadRes.success ? 'HEAD' : '4b825dc642cb6eb9a0ff3e07f4618d9157b46363';
-    diffRes = await runCommand(safeDir, ['diff', diffBase, '--no-ext-diff', '--', ...diffPaths], token);
+    diffRes = await runCommand(safeDir, ['diff', diffBase, '--no-ext-diff', '--', ...diffPaths], token, { logOutput: false });
   }
 
   res.json({
@@ -1146,7 +1171,7 @@ app.post('/api/ai/generate-commit', async (req, res) => {
     messages: [
       {
         role: 'system',
-        content: '你是一个专业的 Git 助手。请根据提供的 Git diff，用中文写一行简明扼要的 Conventional Commits 格式提交说明（例如 "feat: 新增用户登录接口" 或 "fix: 修复日志轮询中的内存泄漏"）。请保持简练，仅返回最终的提交说明文本，不要包含任何 markdown 包裹（如代码块）、额外解释或引号。'
+        content: '你是一个专业的 Git 助手。请根据提供的 Git diff，用中文写一行简明扼要的提交说明。不要使用 feat、fix、chore 等英文前缀，不要使用英文标题。请仅返回最终的中文提交说明文本，不要包含 markdown、额外解释或引号。'
       },
       {
         role: 'user',
@@ -1170,7 +1195,7 @@ app.post('/api/ai/generate-commit', async (req, res) => {
 
     if (!response.ok) {
       const errText = await response.text();
-      return res.json({ success: false, error: `AI 服务返回错误 (${response.status}): ${errText}` });
+      return res.json({ success: false, error: `AI 服务返回错误 (${response.status}): ${maskSensitiveLog(errText, token)}` });
     }
 
     const rawText = await response.text();
@@ -1183,10 +1208,10 @@ app.post('/api/ai/generate-commit', async (req, res) => {
         try {
           data = JSON.parse(rawText.substring(0, lastBraceIndex + 1));
         } catch (innerErr) {
-          return res.json({ success: false, error: `解析 AI 响应失败: ${e.message}。原始响应: ${rawText}` });
+          return res.json({ success: false, error: `解析 AI 响应失败: ${e.message}。原始响应: ${maskSensitiveLog(rawText, token)}` });
         }
       } else {
-        return res.json({ success: false, error: `解析 AI 响应失败: ${e.message}。原始响应: ${rawText}` });
+        return res.json({ success: false, error: `解析 AI 响应失败: ${e.message}。原始响应: ${maskSensitiveLog(rawText, token)}` });
       }
     }
     const aiMessage = data.choices && data.choices[0] && data.choices[0].message
@@ -1248,3 +1273,5 @@ server.on('error', (err) => {
 
   throw err;
 });
+
+

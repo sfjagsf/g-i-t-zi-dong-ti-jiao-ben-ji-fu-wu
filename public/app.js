@@ -95,6 +95,7 @@ const diffBody = document.getElementById('diff-body');
 
 let currentDiffText = '';
 let currentDiffFormat = 'side-by-side'; // side-by-side or line-by-line
+const COMMIT_BUTTON_HTML = '<i data-lucide="upload-cloud"></i> 立即提交并强制推送 (Force Push)';
 
 // Custom Dialog Utility (Returns Promise)
 function showCustomDialog({ title, message, confirmText = '确认', cancelText = '取消', isDanger = false }) {
@@ -1323,7 +1324,6 @@ btnCommitPush.addEventListener('click', async () => {
   }
 
   addSystemLog(`开始提交并强制推送至远程分支 [${selectedBranch}]...`);
-  
   btnCommitPush.disabled = true;
   btnCommitPush.innerText = '正在提交并推送...';
 
@@ -1334,7 +1334,7 @@ btnCommitPush.addEventListener('click', async () => {
   });
 
   btnCommitPush.disabled = false;
-  btnCommitPush.innerHTML = '<i data-lucide="upload-cloud"></i> 立即提交并强制推送 (Force Push)';
+  btnCommitPush.innerHTML = COMMIT_BUTTON_HTML;
   lucide.createIcons();
 
   if (res.success) {

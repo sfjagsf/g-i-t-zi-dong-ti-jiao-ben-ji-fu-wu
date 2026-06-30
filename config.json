@@ -2,9 +2,9 @@
   "githubToken": "",
   "username": "",
   "avatarUrl": "",
-  "aiApiUrl": "http://192.168.0.117:20129/v1",
-  "aiApiKey": "sk-f95271d20cf0d26d-9d3ua8-e028e51f",
-  "aiModelName": "oc/deepseek-v4-flash-free",
+  "aiApiUrl": "http://localhost:11434/v1",
+  "aiApiKey": "",
+  "aiModelName": "",
   "lastProjectPath": "",
   "recentPaths": []
 }
