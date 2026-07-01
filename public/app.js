@@ -1340,7 +1340,9 @@ btnCommitPush.addEventListener('click', async () => {
   if (res.success) {
     addSystemLog(`成功提交并强推至 [${selectedBranch}]`);
     commitDescInput.value = '';
-    refreshLocalChanges();
+    selectedCommitHash = '';
+    await refreshLocalChanges();
+    await loadCommitHistory();
   } else {
     addSystemLog(`提交失败: ${res.error}`);
   }
