@@ -703,7 +703,11 @@ function updateLocalRepoUi(statusRes, absolutePath, { refreshBranches = true, re
     fileChangesListContainer.innerHTML = '<div class="empty-state-text">本地文件夹尚未绑定仓库。在左侧下拉框中选择仓库并点击其分支以建立绑定。</div>';
     changesCountBadge.innerText = 0;
     historyContent.innerHTML = '<div class="empty-state-text">未绑定仓库，无提交历史</div>';
-    addSystemLog('检测到此目录不是 Git 仓库。请在左侧下拉框中选择仓库并点击其分支以建立绑定。');
+    if (statusRes.parentRepoRoot) {
+      addSystemLog(`检测到此目录位于父级 Git 仓库 [${statusRes.parentRepoRoot}] 内。工具不会再误操作父仓库；如需绑定当前目录，请选择仓库分支重新初始化当前目录。`);
+    } else {
+      addSystemLog('检测到此目录不是 Git 仓库。请在左侧下拉框中选择仓库并点击其分支以建立绑定。');
+    }
   }
 }
 

@@ -111,6 +111,19 @@ function resolveExistingDirectory(dirPath) {
   }
 }
 
+function sameDirectory(left, right) {
+  const normalize = (value) => path.resolve(value).replace(/[\\/]+$/, '');
+  const leftPath = normalize(left);
+  const rightPath = normalize(right);
+  return process.platform === 'win32'
+    ? leftPath.toLowerCase() === rightPath.toLowerCase()
+    : leftPath === rightPath;
+}
+
+function hasOwnGitMarker(cwd) {
+  return fs.existsSync(path.join(cwd, '.git'));
+}
+
 function isSafeRelativePathspec(filePath) {
   if (typeof filePath !== 'string' || !filePath.trim() || filePath.includes('\0')) return false;
   if (path.isAbsolute(filePath)) return false;
@@ -129,9 +142,18 @@ function normalizeRemoteUrl(remoteUrl) {
   return cleanRemoteUrl;
 }
 
+async function getGitRepositoryRoot(cwd, token = '') {
+  const result = await runCommand(cwd, ['rev-parse', '--show-toplevel'], token);
+  return result.success ? path.resolve(result.stdout.trim()) : '';
+}
+
 async function isGitRepository(cwd, token = '') {
-  const result = await runCommand(cwd, ['rev-parse', '--is-inside-work-tree'], token);
-  return result.success && result.stdout.trim() === 'true';
+  if (!hasOwnGitMarker(cwd)) {
+    return false;
+  }
+
+  const repoRoot = await getGitRepositoryRoot(cwd, token);
+  return !!repoRoot && sameDirectory(repoRoot, cwd);
 }
 
 function remoteListHasOrigin(remoteOutput) {
@@ -460,7 +482,12 @@ app.post('/api/repo/status', async (req, res) => {
   const isRepo = await isGitRepository(safeDir, token);
 
   if (!isRepo) {
-    return res.json({ success: true, isRepo: false });
+    const parentRepoRoot = await getGitRepositoryRoot(safeDir, token);
+    return res.json({
+      success: true,
+      isRepo: false,
+      parentRepoRoot: parentRepoRoot && !sameDirectory(parentRepoRoot, safeDir) ? parentRepoRoot : ''
+    });
   }
 
   // Get current remote URL
