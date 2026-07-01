@@ -18,6 +18,10 @@ let logPollTimer = null;
 let isLogPolling = false;
 let isBindingInProgress = false;
 let isCommitInProgress = false;
+let isRefreshingChanges = false;
+let repoStatusRequestSeq = 0;
+let historyRequestSeq = 0;
+let refreshChangesRequestSeq = 0;
 
 const MAX_CONSOLE_LINES = 200;
 const LOG_POLL_VISIBLE_MS = 2000;
@@ -666,9 +670,9 @@ async function bindLocalDirectoryToBranch(repo, branchName) {
 
     if (res.success) {
       addSystemLog(`成功关联绑定到 [${repo.fullName}] 的 [${branchName}] 分支`);
-      loadProjectPath(dirPath);
       delete repoBranchesCache[repo.fullName]; // Clear branch cache to refresh status
-      fetchGithubRepos();
+      await loadProjectPath(dirPath);
+      await fetchGithubRepos();
     } else {
       addSystemLog(`关联绑定失败: ${res.error}`);
       await showCustomDialog({
@@ -725,6 +729,7 @@ function updateLocalRepoUi(statusRes, absolutePath, { refreshBranches = true, re
     }
   } else {
     selectedBranch = '';
+    historyRequestSeq += 1;
     activeRepoRibbon.classList.add('hidden');
     fileChangesListContainer.innerHTML = '<div class="empty-state-text">本地文件夹尚未绑定仓库。在左侧下拉框中选择仓库并点击其分支以建立绑定。</div>';
     changesCountBadge.innerText = 0;
@@ -739,10 +744,12 @@ function updateLocalRepoUi(statusRes, absolutePath, { refreshBranches = true, re
 
 async function loadProjectPath(dirPath, isRetry = false) {
   if (!dirPath) return;
+  const requestSeq = ++repoStatusRequestSeq;
   
   addSystemLog(`正在检测本地路径: ${dirPath}`);
   
   const checkPath = await apiPost('/api/fs/validate-path', { dirPath });
+  if (requestSeq !== repoStatusRequestSeq) return;
   if (!checkPath.success) {
     addSystemLog(`路径无效: ${checkPath.error}`);
     activeRepoRibbon.classList.add('hidden');
@@ -757,6 +764,7 @@ async function loadProjectPath(dirPath, isRetry = false) {
 
   // Fetch status
   const statusRes = await apiPost('/api/repo/status', { dirPath: absolutePath });
+  if (requestSeq !== repoStatusRequestSeq) return;
   if (statusRes.success) {
     // Check if we need to auto-initialize or auto-associate the selected remote repository
     if (activeSelectedRepo && !isRetry) {
@@ -776,9 +784,10 @@ async function loadProjectPath(dirPath, isRetry = false) {
           dirPath: absolutePath,
           remoteUrl: activeSelectedRepo.htmlUrl
         });
+        if (requestSeq !== repoStatusRequestSeq) return;
         if (initRes.success) {
           addSystemLog(`自动配置关联成功。`);
-          loadProjectPath(absolutePath, true);
+          await loadProjectPath(absolutePath, true);
           return;
         } else {
           addSystemLog(`自动配置关联失败: ${initRes.error}`);
@@ -792,29 +801,48 @@ async function loadProjectPath(dirPath, isRetry = false) {
   }
 }
 
-async function refreshLocalChanges() {
-  const dirPath = pathInput.value.trim();
-  if (!dirPath) return;
-
-  addSystemLog('正在手动扫描工作区改动...');
-  const checkPath = await apiPost('/api/fs/validate-path', { dirPath });
-  if (!checkPath.success) {
-    addSystemLog(`路径无效: ${checkPath.error}`);
+async function refreshLocalChanges({ force = false } = {}) {
+  if (isRefreshingChanges && !force) {
+    addSystemLog('本地改动刷新正在进行，请稍候。');
     return;
   }
 
-  const absolutePath = checkPath.absolutePath;
-  pathInput.value = absolutePath;
+  const dirPath = pathInput.value.trim();
+  if (!dirPath) return;
 
-  const statusRes = await apiPost('/api/repo/status', { dirPath: absolutePath });
-  if (statusRes.success) {
-    updateLocalRepoUi(statusRes, absolutePath, {
-      refreshBranches: false,
-      refreshHistory: false
-    });
-    addSystemLog('本地改动刷新完成。');
-  } else {
-    addSystemLog(`刷新本地改动失败: ${statusRes.error}`);
+  const requestSeq = ++repoStatusRequestSeq;
+  const refreshSeq = ++refreshChangesRequestSeq;
+  isRefreshingChanges = true;
+  btnRefreshChanges.disabled = true;
+
+  try {
+    addSystemLog('正在手动扫描工作区改动...');
+    const checkPath = await apiPost('/api/fs/validate-path', { dirPath });
+    if (requestSeq !== repoStatusRequestSeq) return;
+    if (!checkPath.success) {
+      addSystemLog(`路径无效: ${checkPath.error}`);
+      return;
+    }
+
+    const absolutePath = checkPath.absolutePath;
+    pathInput.value = absolutePath;
+
+    const statusRes = await apiPost('/api/repo/status', { dirPath: absolutePath });
+    if (requestSeq !== repoStatusRequestSeq) return;
+    if (statusRes.success) {
+      updateLocalRepoUi(statusRes, absolutePath, {
+        refreshBranches: false,
+        refreshHistory: false
+      });
+      addSystemLog('本地改动刷新完成。');
+    } else {
+      addSystemLog(`刷新本地改动失败: ${statusRes.error}`);
+    }
+  } finally {
+    if (refreshSeq === refreshChangesRequestSeq) {
+      isRefreshingChanges = false;
+      btnRefreshChanges.disabled = false;
+    }
   }
 }
 
@@ -1001,10 +1029,16 @@ btnAiCommit.addEventListener('click', async () => {
 async function loadCommitHistory() {
   const dirPath = pathInput.value.trim();
   if (!dirPath || !selectedBranch) return;
+  const requestSeq = ++historyRequestSeq;
+  const branchAtRequest = selectedBranch;
+  const dirPathAtRequest = dirPath;
 
   historyContent.innerHTML = '<div class="loading-spinner">拉取提交历史中...</div>';
 
-  const res = await apiPost('/api/repo/history', { dirPath, branch: selectedBranch });
+  const res = await apiPost('/api/repo/history', { dirPath, branch: branchAtRequest });
+  if (requestSeq !== historyRequestSeq || selectedBranch !== branchAtRequest || pathInput.value.trim() !== dirPathAtRequest) {
+    return;
+  }
   if (res.success) {
     historyContent.innerHTML = '';
     const commits = res.commits;
@@ -1391,7 +1425,7 @@ btnCommitPush.addEventListener('click', async () => {
       commitDescInput.value = '';
       selectedCommitHash = '';
       await Promise.all([
-        refreshLocalChanges(),
+        refreshLocalChanges({ force: true }),
         loadCommitHistory()
       ]);
       addSystemLog(`界面刷新完成。`);
@@ -1548,12 +1582,12 @@ async function pollLogs() {
   try {
     if (document.hidden) return;
 
-    const res = await apiGet(`/api/git-logs?offset=${logOffset}`);
+    const res = await apiGet(`/api/git-logs?afterId=${logOffset}`);
     if (res && res.success && Array.isArray(res.logs)) {
       if (res.logs.length > 0) {
         appendConsoleLines(res.logs);
       }
-      logOffset = res.nextOffset;
+      logOffset = res.nextId ?? res.nextOffset ?? logOffset;
     }
   } finally {
     isLogPolling = false;

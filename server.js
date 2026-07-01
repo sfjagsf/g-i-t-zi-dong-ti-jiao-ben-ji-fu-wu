@@ -16,7 +16,10 @@ const CONFIG_FILE = process.env.GFLOW_CONFIG_FILE || path.join(__dirname, 'confi
 const SENSITIVE_CONFIG_KEYS = new Set(['githubToken', 'aiApiKey']);
 
 // Memory logs of executed git commands
+const MAX_GIT_COMMAND_LOGS = 500;
 let gitCommandLogs = [];
+let gitCommandLogSeq = 0;
+let gitCommandRunSeq = 0;
 
 function readJsonFile(filePath) {
   if (fs.existsSync(filePath)) {
@@ -99,6 +102,26 @@ function buildGitEnv(token = '') {
   });
 
   return env;
+}
+
+function appendGitCommandLog(type, text, timestamp) {
+  gitCommandLogs.push({
+    id: ++gitCommandLogSeq,
+    type,
+    text,
+    timestamp
+  });
+
+  while (gitCommandLogs.length > MAX_GIT_COMMAND_LOGS) {
+    gitCommandLogs.shift();
+  }
+}
+
+function prefixGitLogOutput(commandId, text) {
+  return String(text)
+    .split(/\r?\n/)
+    .map(line => `[git:${commandId}] ${line}`)
+    .join('\n');
 }
 
 function resolveExistingDirectory(dirPath) {
@@ -317,6 +340,7 @@ async function getDiffIncludingUntracked(cwd, token = '', maxChars = 20000, opti
 function runCommand(cwd, args, token = '', options = {}) {
   return new Promise((resolve) => {
     const timestamp = new Date().toLocaleTimeString();
+    const commandId = ++gitCommandRunSeq;
     const logCommand = options.logCommand !== false;
     const logOutput = options.logOutput !== false;
     const returnRawOutput = options.returnRawOutput === true;
@@ -333,16 +357,7 @@ function runCommand(cwd, args, token = '', options = {}) {
     const cmdForLog = maskSensitiveLog(commandLine, token);
     
     if (logCommand) {
-      gitCommandLogs.push({
-        type: 'command',
-        text: `$ ${cmdForLog}`,
-        timestamp
-      });
-
-      // Cap in-memory logs to prevent memory leaks (Max 500 entries)
-      if (gitCommandLogs.length > 500) {
-        gitCommandLogs.shift();
-      }
+      appendGitCommandLog('command', `$ [git:${commandId}] ${cmdForLog}`, timestamp);
     }
 
     execFile('git', args, {
@@ -360,12 +375,10 @@ function runCommand(cwd, args, token = '', options = {}) {
       const maskedErr = maskSensitiveLog(errText, token);
 
       if (logOutput && maskedOut) {
-        gitCommandLogs.push({ type: 'stdout', text: maskedOut, timestamp });
-        if (gitCommandLogs.length > 500) gitCommandLogs.shift();
+        appendGitCommandLog('stdout', prefixGitLogOutput(commandId, maskedOut), timestamp);
       }
       if (logOutput && maskedErr) {
-        gitCommandLogs.push({ type: 'stderr', text: maskedErr, timestamp });
-        if (gitCommandLogs.length > 500) gitCommandLogs.shift();
+        appendGitCommandLog('stderr', prefixGitLogOutput(commandId, maskedErr), timestamp);
       }
 
       const returnedStdout = returnRawOutput ? outText : maskedOut;
@@ -478,20 +491,23 @@ app.post('/api/config', (req, res) => {
   res.json({ success: true, config: publicConfig(updated) });
 });
 
-// Get Git commands logs (supporting incremental polling with offset)
+// Get Git commands logs (supporting incremental polling with stable log ids)
 app.get('/api/git-logs', (req, res) => {
-  const offset = parseInt(req.query.offset, 10) || 0;
-  const slicedLogs = gitCommandLogs.slice(offset);
+  const afterId = parseInt(req.query.afterId ?? req.query.offset, 10) || 0;
+  const slicedLogs = gitCommandLogs.filter(log => log.id > afterId);
   res.json({
     success: true,
     logs: slicedLogs,
-    nextOffset: gitCommandLogs.length
+    nextId: gitCommandLogSeq,
+    nextOffset: gitCommandLogSeq
   });
 });
 
 // Clear Git commands logs
 app.post('/api/git-logs/clear', (req, res) => {
   gitCommandLogs = [];
+  gitCommandLogSeq = 0;
+  gitCommandRunSeq = 0;
   res.json({ success: true });
 });
 
