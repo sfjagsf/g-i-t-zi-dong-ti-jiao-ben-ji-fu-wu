@@ -27,6 +27,7 @@ const MAX_CONSOLE_LINES = 200;
 const LOG_POLL_VISIBLE_MS = 2000;
 const LOG_POLL_HIDDEN_MS = 8000;
 const MAX_RENDERED_DIFF_CHARS = 600000;
+const PROTECTED_PROJECT_PATH_MESSAGE = '已阻止操作 GFlow 工具自身目录。请链接真实项目目录，不要把工具安装目录作为目标仓库。';
 
 // Repository dropdown and branch list caches
 let globalReposList = [];
@@ -477,6 +478,10 @@ repoSelect.addEventListener('change', async () => {
     // If local path is set, check if we need to auto-init or re-associate remote origin
     const dirPath = pathInput.value.trim();
     if (dirPath) {
+      if (currentRepoStatus.protectedPath) {
+        addSystemLog(PROTECTED_PROJECT_PATH_MESSAGE);
+        return;
+      }
       if (currentRepoStatus.parentRepoRoot) {
         addSystemLog(`当前路径位于父级 Git 仓库 [${currentRepoStatus.parentRepoRoot}] 内，已跳过自动初始化。需要绑定当前目录时，请手动点击目标分支确认绑定。`);
         return;
@@ -641,6 +646,16 @@ async function bindLocalDirectoryToBranch(repo, branchName) {
 
     // Check if directory already has changes
     const checkStatus = await apiPost('/api/repo/status', { dirPath });
+    if (checkStatus.success && checkStatus.protectedPath) {
+      addSystemLog(checkStatus.error || PROTECTED_PROJECT_PATH_MESSAGE);
+      await showCustomDialog({
+        title: '已阻止操作',
+        message: checkStatus.error || PROTECTED_PROJECT_PATH_MESSAGE,
+        confirmText: '我知道了'
+      });
+      return;
+    }
+
     let hasChanges = false;
     if (checkStatus.success && checkStatus.isRepo && checkStatus.hasChanges) {
       hasChanges = true;
@@ -731,10 +746,14 @@ function updateLocalRepoUi(statusRes, absolutePath, { refreshBranches = true, re
     selectedBranch = '';
     historyRequestSeq += 1;
     activeRepoRibbon.classList.add('hidden');
-    fileChangesListContainer.innerHTML = '<div class="empty-state-text">本地文件夹尚未绑定仓库。在左侧下拉框中选择仓库并点击其分支以建立绑定。</div>';
+    fileChangesListContainer.innerHTML = statusRes.protectedPath
+      ? '<div class="empty-state-text">已阻止操作工具自身目录。请换一个真实项目目录。</div>'
+      : '<div class="empty-state-text">本地文件夹尚未绑定仓库。在左侧下拉框中选择仓库并点击其分支以建立绑定。</div>';
     changesCountBadge.innerText = 0;
     historyContent.innerHTML = '<div class="empty-state-text">未绑定仓库，无提交历史</div>';
-    if (statusRes.parentRepoRoot) {
+    if (statusRes.protectedPath) {
+      addSystemLog(statusRes.error || PROTECTED_PROJECT_PATH_MESSAGE);
+    } else if (statusRes.parentRepoRoot) {
       addSystemLog(`检测到此目录位于父级 Git 仓库 [${statusRes.parentRepoRoot}] 内。工具不会再误操作父仓库；如需绑定当前目录，请选择仓库分支重新初始化当前目录。`);
     } else {
       addSystemLog('检测到此目录不是 Git 仓库。请在左侧下拉框中选择仓库并点击其分支以建立绑定。');
@@ -758,6 +777,18 @@ async function loadProjectPath(dirPath, isRetry = false) {
 
   const absolutePath = checkPath.absolutePath;
   pathInput.value = absolutePath;
+
+  if (checkPath.protectedPath) {
+    updateLocalRepoUi({
+      success: true,
+      isRepo: false,
+      protectedPath: true,
+      protectedRoot: checkPath.protectedRoot,
+      error: PROTECTED_PROJECT_PATH_MESSAGE,
+      changesList: []
+    }, absolutePath);
+    return;
+  }
 
   // Add path to config recentPaths
   addPathToRecent(absolutePath);
@@ -826,6 +857,21 @@ async function refreshLocalChanges({ force = false } = {}) {
 
     const absolutePath = checkPath.absolutePath;
     pathInput.value = absolutePath;
+
+    if (checkPath.protectedPath) {
+      updateLocalRepoUi({
+        success: true,
+        isRepo: false,
+        protectedPath: true,
+        protectedRoot: checkPath.protectedRoot,
+        error: PROTECTED_PROJECT_PATH_MESSAGE,
+        changesList: []
+      }, absolutePath, {
+        refreshBranches: false,
+        refreshHistory: false
+      });
+      return;
+    }
 
     const statusRes = await apiPost('/api/repo/status', { dirPath: absolutePath });
     if (requestSeq !== repoStatusRequestSeq) return;

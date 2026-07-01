@@ -13,7 +13,9 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Tracked config.json is a safe defaults file. Secrets are saved locally only.
 const CONFIG_DEFAULT_FILE = path.join(__dirname, 'config.json');
 const CONFIG_FILE = process.env.GFLOW_CONFIG_FILE || path.join(__dirname, 'config.local.json');
+const APP_ROOT = path.resolve(__dirname);
 const SENSITIVE_CONFIG_KEYS = new Set(['githubToken', 'aiApiKey']);
+const PROTECTED_PROJECT_PATH_ERROR = '已阻止操作工具自身目录。请链接真实项目目录，不要把 GFlow 工具安装目录作为目标仓库。';
 
 // Memory logs of executed git commands
 const MAX_GIT_COMMAND_LOGS = 500;
@@ -45,6 +47,8 @@ function publicConfig(config) {
   for (const key of SENSITIVE_CONFIG_KEYS) {
     safeConfig[key] = '';
   }
+  safeConfig.lastProjectPath = sanitizeConfiguredProjectPath(config.lastProjectPath);
+  safeConfig.recentPaths = sanitizeConfiguredRecentPaths(config.recentPaths);
   safeConfig.hasGithubToken = !!config.githubToken;
   safeConfig.hasAiApiKey = !!config.aiApiKey;
   return safeConfig;
@@ -143,6 +147,66 @@ function sameDirectory(left, right) {
     : leftPath === rightPath;
 }
 
+function isSameOrInsideDirectory(candidate, parent) {
+  const normalize = (value) => {
+    const resolved = path.resolve(value).replace(/[\\/]+$/, '');
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  const candidatePath = normalize(candidate);
+  const parentPath = normalize(parent);
+  const relativePath = path.relative(parentPath, candidatePath);
+  return relativePath === '' || (!!relativePath && !relativePath.startsWith('..') && !path.isAbsolute(relativePath));
+}
+
+function isProtectedProjectDirectory(dirPath) {
+  return isSameOrInsideDirectory(dirPath, APP_ROOT);
+}
+
+function protectedProjectStatus(safeDir) {
+  return {
+    success: true,
+    isRepo: false,
+    protectedPath: true,
+    protectedRoot: APP_ROOT,
+    selectedPath: safeDir,
+    error: PROTECTED_PROJECT_PATH_ERROR
+  };
+}
+
+function rejectProtectedProjectDirectory(res, safeDir) {
+  if (!isProtectedProjectDirectory(safeDir)) return false;
+  res.status(400).json({
+    success: false,
+    protectedPath: true,
+    protectedRoot: APP_ROOT,
+    selectedPath: safeDir,
+    error: PROTECTED_PROJECT_PATH_ERROR
+  });
+  return true;
+}
+
+function sanitizeConfiguredProjectPath(value) {
+  if (typeof value !== 'string' || !value.trim()) return '';
+  const safeDir = resolveExistingDirectory(value);
+  if (safeDir && isProtectedProjectDirectory(safeDir)) return '';
+  return value;
+}
+
+function sanitizeConfiguredRecentPaths(paths) {
+  if (!Array.isArray(paths)) return [];
+  const seen = new Set();
+  const cleanPaths = [];
+  for (const entry of paths) {
+    if (typeof entry !== 'string' || !entry.trim()) continue;
+    const safeDir = resolveExistingDirectory(entry);
+    if (safeDir && isProtectedProjectDirectory(safeDir)) continue;
+    if (seen.has(entry)) continue;
+    seen.add(entry);
+    cleanPaths.push(entry);
+  }
+  return cleanPaths.slice(0, 10);
+}
+
 function hasOwnGitMarker(cwd) {
   return fs.existsSync(path.join(cwd, '.git'));
 }
@@ -183,6 +247,16 @@ async function resolveOwnGitRepository(dirPath, token = '') {
   const safeDir = resolveExistingDirectory(dirPath);
   if (!safeDir) {
     return { success: false, statusCode: 400, error: 'Directory does not exist.' };
+  }
+
+  if (isProtectedProjectDirectory(safeDir)) {
+    return {
+      success: false,
+      statusCode: 400,
+      error: PROTECTED_PROJECT_PATH_ERROR,
+      protectedPath: true,
+      protectedRoot: APP_ROOT
+    };
   }
 
   if (await isGitRepository(safeDir, token)) {
@@ -484,7 +558,13 @@ app.post('/api/config', (req, res) => {
     if (SENSITIVE_CONFIG_KEYS.has(field) && typeof value === 'string' && value.includes('*')) {
       continue;
     }
-    updated[field] = value;
+    if (field === 'lastProjectPath') {
+      updated[field] = sanitizeConfiguredProjectPath(value);
+    } else if (field === 'recentPaths') {
+      updated[field] = sanitizeConfiguredRecentPaths(value);
+    } else {
+      updated[field] = value;
+    }
   }
 
   saveConfig(updated);
@@ -517,6 +597,10 @@ app.post('/api/repo/status', async (req, res) => {
   const safeDir = resolveExistingDirectory(dirPath);
   if (!safeDir) {
     return res.status(400).json({ success: false, error: 'Directory does not exist.' });
+  }
+
+  if (isProtectedProjectDirectory(safeDir)) {
+    return res.json(protectedProjectStatus(safeDir));
   }
 
   const config = loadConfig();
@@ -568,6 +652,7 @@ app.post('/api/repo/init', async (req, res) => {
   if (!safeDir) {
     return res.status(400).json({ success: false, error: 'Directory does not exist.' });
   }
+  if (rejectProtectedProjectDirectory(res, safeDir)) return;
 
   const config = loadConfig();
   const token = config.githubToken || '';
@@ -1090,6 +1175,7 @@ app.post('/api/repo/bind', async (req, res) => {
   if (!safeDir) {
     return res.status(400).json({ success: false, error: '本地物理路径不存在' });
   }
+  if (rejectProtectedProjectDirectory(res, safeDir)) return;
   if (!remoteUrl || !branch) {
     return res.status(400).json({ success: false, error: '远程仓库地址和分支必填' });
   }
@@ -1182,7 +1268,12 @@ app.post('/api/fs/validate-path', (req, res) => {
   if (!absolute) {
     return res.json({ success: false, error: 'Directory does not exist' });
   }
-  res.json({ success: true, absolutePath: absolute });
+  res.json({
+    success: true,
+    absolutePath: absolute,
+    protectedPath: isProtectedProjectDirectory(absolute),
+    protectedRoot: isProtectedProjectDirectory(absolute) ? APP_ROOT : ''
+  });
 });
 
 // Get Git Diff for a specific file (tracked or untracked)
