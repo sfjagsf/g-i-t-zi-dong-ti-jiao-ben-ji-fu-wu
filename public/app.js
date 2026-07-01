@@ -625,42 +625,42 @@ async function bindLocalDirectoryToBranch(repo, branchName) {
     return;
   }
 
-  const dirPath = pathInput.value.trim();
-  
-  if (!dirPath) {
-    await showCustomDialog({
-      title: '提示',
-      message: '请先在顶部输入框粘贴或拖入您想关联的本地物理文件夹路径，然后再点击分支进行绑定！',
-      confirmText: '我知道了'
-    });
-    pathInput.focus();
-    return;
-  }
-
-  // Check if directory already has changes
-  const checkStatus = await apiPost('/api/repo/status', { dirPath });
-  let hasChanges = false;
-  if (checkStatus.success && checkStatus.isRepo && checkStatus.hasChanges) {
-    hasChanges = true;
-  }
-
-  // If there are changes, alert the user first
-  if (hasChanges) {
-    const proceed = await showCustomDialog({
-      title: '未提交的修改',
-      message: '当前本地文件夹有未提交的改动。切换绑定会丢弃或影响本地未提交的修改。是否确定要继续绑定？',
-      confirmText: '强制切换并绑定',
-      cancelText: '取消',
-      isDanger: true
-    });
-    if (!proceed) {
-      addSystemLog('用户取消切换绑定操作。');
-      return;
-    }
-  }
-
   isBindingInProgress = true;
   try {
+    const dirPath = pathInput.value.trim();
+
+    if (!dirPath) {
+      await showCustomDialog({
+        title: '提示',
+        message: '请先在顶部输入框粘贴或拖入您想关联的本地物理文件夹路径，然后再点击分支进行绑定！',
+        confirmText: '我知道了'
+      });
+      pathInput.focus();
+      return;
+    }
+
+    // Check if directory already has changes
+    const checkStatus = await apiPost('/api/repo/status', { dirPath });
+    let hasChanges = false;
+    if (checkStatus.success && checkStatus.isRepo && checkStatus.hasChanges) {
+      hasChanges = true;
+    }
+
+    // If there are changes, alert the user first
+    if (hasChanges) {
+      const proceed = await showCustomDialog({
+        title: '未提交的修改',
+        message: '当前本地文件夹有未提交的改动。切换绑定会丢弃或影响本地未提交的修改。是否确定要继续绑定？',
+        confirmText: '强制切换并绑定',
+        cancelText: '取消',
+        isDanger: true
+      });
+      if (!proceed) {
+        addSystemLog('用户取消切换绑定操作。');
+        return;
+      }
+    }
+
     addSystemLog(`正在将本地目录 [${dirPath}] 绑定至远程 [${repo.fullName}] 的 [${branchName}] 分支...`);
     const res = await apiPost('/api/repo/bind', {
       dirPath,
