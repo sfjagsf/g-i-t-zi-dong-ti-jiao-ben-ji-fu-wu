@@ -156,6 +156,32 @@ async function isGitRepository(cwd, token = '') {
   return !!repoRoot && sameDirectory(repoRoot, cwd);
 }
 
+async function resolveOwnGitRepository(dirPath, token = '') {
+  const safeDir = resolveExistingDirectory(dirPath);
+  if (!safeDir) {
+    return { success: false, statusCode: 400, error: 'Directory does not exist.' };
+  }
+
+  if (await isGitRepository(safeDir, token)) {
+    return { success: true, safeDir };
+  }
+
+  const parentRepoRoot = await getGitRepositoryRoot(safeDir, token);
+  if (parentRepoRoot && !sameDirectory(parentRepoRoot, safeDir)) {
+    return {
+      success: false,
+      statusCode: 400,
+      error: `Selected directory is inside another Git repository (${parentRepoRoot}). Please initialize or select the exact repository root.`
+    };
+  }
+
+  return {
+    success: false,
+    statusCode: 400,
+    error: 'Selected directory is not an initialized Git repository.'
+  };
+}
+
 function remoteListHasOrigin(remoteOutput) {
   return remoteOutput.split('\n').map(remote => remote.trim()).includes('origin');
 }
@@ -566,13 +592,13 @@ app.post('/api/repo/init', async (req, res) => {
 // Fetch and list remote branches (via git ls-remote)
 app.post('/api/repo/branches', async (req, res) => {
   const { dirPath } = req.body;
-  const safeDir = resolveExistingDirectory(dirPath);
-  if (!safeDir) {
-    return res.status(400).json({ success: false, error: 'Directory does not exist.' });
-  }
-
   const config = loadConfig();
   const token = config.githubToken || '';
+  const repoCheck = await resolveOwnGitRepository(dirPath, token);
+  if (!repoCheck.success) {
+    return res.status(repoCheck.statusCode).json({ success: false, error: repoCheck.error });
+  }
+  const { safeDir } = repoCheck;
 
   const lsRes = await runCommand(safeDir, ['ls-remote', '--heads', 'origin'], token);
   if (!lsRes.success) {
@@ -600,13 +626,13 @@ app.post('/api/repo/branches', async (req, res) => {
 // Fetch commit history of a branch with --graph
 app.post('/api/repo/history', async (req, res) => {
   const { dirPath, branch } = req.body;
-  const safeDir = resolveExistingDirectory(dirPath);
-  if (!safeDir) {
-    return res.status(400).json({ success: false, error: 'Directory does not exist.' });
-  }
-
   const config = loadConfig();
   const token = config.githubToken || '';
+  const repoCheck = await resolveOwnGitRepository(dirPath, token);
+  if (!repoCheck.success) {
+    return res.status(repoCheck.statusCode).json({ success: false, error: repoCheck.error });
+  }
+  const { safeDir } = repoCheck;
   const branchValidation = await validateBranchName(safeDir, branch, token);
   if (!branchValidation.success) {
     return res.status(400).json({ success: false, error: branchValidation.error });
@@ -644,13 +670,13 @@ app.post('/api/repo/history', async (req, res) => {
 // Commit and Force Push
 app.post('/api/repo/commit', async (req, res) => {
   const { dirPath, branch, description } = req.body;
-  const safeDir = resolveExistingDirectory(dirPath);
-  if (!safeDir) {
-    return res.status(400).json({ success: false, error: 'Directory does not exist.' });
-  }
-
   const config = loadConfig();
   const token = config.githubToken || '';
+  const repoCheck = await resolveOwnGitRepository(dirPath, token);
+  if (!repoCheck.success) {
+    return res.status(repoCheck.statusCode).json({ success: false, error: repoCheck.error });
+  }
+  const { safeDir } = repoCheck;
 
   if (!branch) {
     return res.status(400).json({ success: false, error: 'Branch is required.' });
@@ -693,13 +719,13 @@ app.post('/api/repo/commit', async (req, res) => {
 // Switch branch
 app.post('/api/repo/switch', async (req, res) => {
   const { dirPath, branch, force } = req.body;
-  const safeDir = resolveExistingDirectory(dirPath);
-  if (!safeDir) {
-    return res.status(400).json({ success: false, error: 'Directory does not exist.' });
-  }
-
   const config = loadConfig();
   const token = config.githubToken || '';
+  const repoCheck = await resolveOwnGitRepository(dirPath, token);
+  if (!repoCheck.success) {
+    return res.status(repoCheck.statusCode).json({ success: false, error: repoCheck.error });
+  }
+  const { safeDir } = repoCheck;
   const branchValidation = await validateBranchName(safeDir, branch, token);
   if (!branchValidation.success) {
     return res.status(400).json({ success: false, error: branchValidation.error });
@@ -743,13 +769,13 @@ app.post('/api/repo/switch', async (req, res) => {
 // Create branch
 app.post('/api/repo/create-branch', async (req, res) => {
   const { dirPath, newBranchName, fromHash } = req.body;
-  const safeDir = resolveExistingDirectory(dirPath);
-  if (!safeDir) {
-    return res.status(400).json({ success: false, error: 'Directory does not exist.' });
-  }
-
   const config = loadConfig();
   const token = config.githubToken || '';
+  const repoCheck = await resolveOwnGitRepository(dirPath, token);
+  if (!repoCheck.success) {
+    return res.status(repoCheck.statusCode).json({ success: false, error: repoCheck.error });
+  }
+  const { safeDir } = repoCheck;
 
   if (!newBranchName) {
     return res.status(400).json({ success: false, error: 'New branch name is required.' });
@@ -810,13 +836,13 @@ app.post('/api/repo/create-branch', async (req, res) => {
 // Delete remote branch
 app.post('/api/repo/delete-branch', async (req, res) => {
   const { dirPath, branchToDelete } = req.body;
-  const safeDir = resolveExistingDirectory(dirPath);
-  if (!safeDir) {
-    return res.status(400).json({ success: false, error: 'Directory does not exist.' });
-  }
-
   const config = loadConfig();
   const token = config.githubToken || '';
+  const repoCheck = await resolveOwnGitRepository(dirPath, token);
+  if (!repoCheck.success) {
+    return res.status(repoCheck.statusCode).json({ success: false, error: repoCheck.error });
+  }
+  const { safeDir } = repoCheck;
 
   if (!branchToDelete) {
     return res.status(400).json({ success: false, error: 'Branch name is required.' });
@@ -859,13 +885,13 @@ app.post('/api/repo/delete-branch', async (req, res) => {
 // Reset branch to commit hash
 app.post('/api/repo/reset', async (req, res) => {
   const { dirPath, branch, hash } = req.body;
-  const safeDir = resolveExistingDirectory(dirPath);
-  if (!safeDir) {
-    return res.status(400).json({ success: false, error: 'Directory does not exist.' });
-  }
-
   const config = loadConfig();
   const token = config.githubToken || '';
+  const repoCheck = await resolveOwnGitRepository(dirPath, token);
+  if (!repoCheck.success) {
+    return res.status(repoCheck.statusCode).json({ success: false, error: repoCheck.error });
+  }
+  const { safeDir } = repoCheck;
 
   if (!branch || !hash) {
     return res.status(400).json({ success: false, error: 'Branch and hash are required.' });
@@ -1137,9 +1163,15 @@ app.post('/api/fs/validate-path', (req, res) => {
 // Get Git Diff for a specific file (tracked or untracked)
 app.post('/api/repo/diff', async (req, res) => {
   const { dirPath, filePath, oldPath } = req.body;
-  const safeDir = resolveExistingDirectory(dirPath);
-  if (!safeDir || !filePath) {
-    return res.status(400).json({ success: false, error: 'Workspace path and file path are required.' });
+  const config = loadConfig();
+  const token = config.githubToken || '';
+  const repoCheck = await resolveOwnGitRepository(dirPath, token);
+  if (!repoCheck.success) {
+    return res.status(repoCheck.statusCode).json({ success: false, error: repoCheck.error });
+  }
+  const { safeDir } = repoCheck;
+  if (!filePath) {
+    return res.status(400).json({ success: false, error: 'File path is required.' });
   }
   if (!isSafeRelativePathspec(filePath)) {
     return res.status(400).json({ success: false, error: 'File path must be a repository-relative path.' });
@@ -1147,9 +1179,6 @@ app.post('/api/repo/diff', async (req, res) => {
   if (oldPath && !isSafeRelativePathspec(oldPath)) {
     return res.status(400).json({ success: false, error: 'Old file path must be a repository-relative path.' });
   }
-
-  const config = loadConfig();
-  const token = config.githubToken || '';
 
   // Check if file is untracked
   const statusRes = await runCommand(safeDir, ['status', '--porcelain=v1', '-z', '--', filePath], token, { trimOutput: false });
@@ -1178,17 +1207,17 @@ app.post('/api/repo/diff', async (req, res) => {
 // Generate AI commit message from git diff
 app.post('/api/ai/generate-commit', async (req, res) => {
   const { dirPath } = req.body;
-  const safeDir = resolveExistingDirectory(dirPath);
-  if (!safeDir) {
-    return res.status(400).json({ success: false, error: 'Workspace directory does not exist.' });
-  }
-
   const config = loadConfig();
+  const token = config.githubToken || '';
+  const repoCheck = await resolveOwnGitRepository(dirPath, token);
+  if (!repoCheck.success) {
+    return res.status(repoCheck.statusCode).json({ success: false, error: repoCheck.error });
+  }
+  const { safeDir } = repoCheck;
   const aiUrl = normalizeChatCompletionsUrl(config.aiApiUrl);
 
   const aiKey = config.aiApiKey || '';
   const aiModel = config.aiModelName || 'deepseek-chat';
-  const token = config.githubToken || '';
 
   const diffText = await getDiffIncludingUntracked(safeDir, token);
 

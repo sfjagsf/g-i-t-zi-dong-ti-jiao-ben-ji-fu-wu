@@ -471,6 +471,11 @@ repoSelect.addEventListener('change', async () => {
     // If local path is set, check if we need to auto-init or re-associate remote origin
     const dirPath = pathInput.value.trim();
     if (dirPath) {
+      if (currentRepoStatus.parentRepoRoot) {
+        addSystemLog(`当前路径位于父级 Git 仓库 [${currentRepoStatus.parentRepoRoot}] 内，已跳过自动初始化。需要绑定当前目录时，请手动点击目标分支确认绑定。`);
+        return;
+      }
+
       const needsInitOrBind = !currentRepoStatus.isRepo || 
                               !currentRepoStatus.remoteUrl || 
                               !isMatchingRemote(currentRepoStatus.remoteUrl, match.fullName);
@@ -667,13 +672,21 @@ async function bindLocalDirectoryToBranch(repo, branchName) {
 
 // Load project path & verify repo status
 function updateLocalRepoUi(statusRes, absolutePath, { refreshBranches = true, refreshHistory = true } = {}) {
-  currentRepoStatus = statusRes;
+  currentRepoStatus = {
+    isRepo: false,
+    remoteUrl: '',
+    currentBranch: '',
+    hasChanges: false,
+    changesList: [],
+    ...statusRes,
+    changesList: Array.isArray(statusRes.changesList) ? statusRes.changesList : []
+  };
 
   if (statusRes.isRepo) {
     activeRepoRibbon.classList.remove('hidden');
     ribbonPath.innerText = absolutePath;
     ribbonBranch.innerText = statusRes.currentBranch || 'DETACHED';
-    selectedBranch = statusRes.currentBranch;
+    selectedBranch = statusRes.currentBranch || '';
 
     if (globalReposList.length > 0 && statusRes.remoteUrl) {
       const match = globalReposList.find(repo => isMatchingRemote(statusRes.remoteUrl, repo.fullName));
@@ -699,6 +712,7 @@ function updateLocalRepoUi(statusRes, absolutePath, { refreshBranches = true, re
       loadCommitHistory();
     }
   } else {
+    selectedBranch = '';
     activeRepoRibbon.classList.add('hidden');
     fileChangesListContainer.innerHTML = '<div class="empty-state-text">本地文件夹尚未绑定仓库。在左侧下拉框中选择仓库并点击其分支以建立绑定。</div>';
     changesCountBadge.innerText = 0;
@@ -734,6 +748,12 @@ async function loadProjectPath(dirPath, isRetry = false) {
   if (statusRes.success) {
     // Check if we need to auto-initialize or auto-associate the selected remote repository
     if (activeSelectedRepo && !isRetry) {
+      if (statusRes.parentRepoRoot) {
+        updateLocalRepoUi(statusRes, absolutePath);
+        addSystemLog(`当前路径位于父级 Git 仓库 [${statusRes.parentRepoRoot}] 内，已跳过自动初始化。需要绑定当前目录时，请手动点击目标分支确认绑定。`);
+        return;
+      }
+
       const needsInitOrBind = !statusRes.isRepo || 
                               !statusRes.remoteUrl || 
                               !isMatchingRemote(statusRes.remoteUrl, activeSelectedRepo.fullName);
