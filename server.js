@@ -78,15 +78,25 @@ function buildGitEnv(token = '') {
   const env = {
     ...process.env,
     GIT_TERMINAL_PROMPT: '0',
-    GCM_INTERACTIVE: 'Never'
+    GCM_INTERACTIVE: 'never'
   };
+
+  const gitConfig = [
+    // Keep backend git commands non-interactive; otherwise Git Credential Manager
+    // may open a GitHub account picker from the local browser session.
+    ['credential.helper', '']
+  ];
 
   if (token) {
     const basicAuth = Buffer.from(`x-access-token:${token}`, 'utf8').toString('base64');
-    env.GIT_CONFIG_COUNT = '1';
-    env.GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader';
-    env.GIT_CONFIG_VALUE_0 = `AUTHORIZATION: basic ${basicAuth}`;
+    gitConfig.push(['http.https://github.com/.extraheader', `AUTHORIZATION: basic ${basicAuth}`]);
   }
+
+  env.GIT_CONFIG_COUNT = String(gitConfig.length);
+  gitConfig.forEach(([key, value], index) => {
+    env[`GIT_CONFIG_KEY_${index}`] = key;
+    env[`GIT_CONFIG_VALUE_${index}`] = value;
+  });
 
   return env;
 }
