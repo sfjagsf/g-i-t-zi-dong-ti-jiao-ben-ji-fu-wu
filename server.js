@@ -670,6 +670,7 @@ app.post('/api/repo/history', async (req, res) => {
 // Commit and Force Push
 app.post('/api/repo/commit', async (req, res) => {
   const { dirPath, branch, description } = req.body;
+  const operationStartedAt = Date.now();
   const config = loadConfig();
   const token = config.githubToken || '';
   const repoCheck = await resolveOwnGitRepository(dirPath, token);
@@ -708,12 +709,20 @@ app.post('/api/repo/commit', async (req, res) => {
     return res.json({ success: false, error: 'Failed to commit: ' + commitRes.error });
   }
 
+  const pushStartedAt = Date.now();
   const pushRes = await runCommand(safeDir, ['push', '--force-with-lease', 'origin', branch], token);
+  const pushDurationMs = Date.now() - pushStartedAt;
   if (!pushRes.success) {
     return res.json({ success: false, error: 'Failed to push: ' + pushRes.error });
   }
 
-  res.json({ success: true });
+  const headRes = await runCommand(safeDir, ['rev-parse', '--short', 'HEAD'], token, { logOutput: false });
+  res.json({
+    success: true,
+    commitHash: headRes.success ? headRes.stdout : '',
+    pushDurationMs,
+    totalDurationMs: Date.now() - operationStartedAt
+  });
 });
 
 // Switch branch

@@ -16,6 +16,8 @@ let logOffset = 0;
 let githubActionRuns = [];
 let logPollTimer = null;
 let isLogPolling = false;
+let isBindingInProgress = false;
+let isCommitInProgress = false;
 
 const MAX_CONSOLE_LINES = 200;
 const LOG_POLL_VISIBLE_MS = 2000;
@@ -614,6 +616,11 @@ function isMatchingRemote(url, fullName) {
 
 // Bind local directory to repository and branch
 async function bindLocalDirectoryToBranch(repo, branchName) {
+  if (isBindingInProgress) {
+    addSystemLog('已有绑定操作正在执行，请稍候。');
+    return;
+  }
+
   const dirPath = pathInput.value.trim();
   
   if (!dirPath) {
@@ -648,25 +655,30 @@ async function bindLocalDirectoryToBranch(repo, branchName) {
     }
   }
 
-  addSystemLog(`正在将本地目录 [${dirPath}] 绑定至远程 [${repo.fullName}] 的 [${branchName}] 分支...`);
-  const res = await apiPost('/api/repo/bind', {
-    dirPath,
-    remoteUrl: repo.htmlUrl,
-    branch: branchName
-  });
-
-  if (res.success) {
-    addSystemLog(`成功关联绑定到 [${repo.fullName}] 的 [${branchName}] 分支`);
-    loadProjectPath(dirPath);
-    delete repoBranchesCache[repo.fullName]; // Clear branch cache to refresh status
-    fetchGithubRepos();
-  } else {
-    addSystemLog(`关联绑定失败: ${res.error}`);
-    await showCustomDialog({
-      title: '绑定失败',
-      message: `无法将本地文件夹与远程分支绑定，原因: ${res.error}`,
-      confirmText: '关闭'
+  isBindingInProgress = true;
+  try {
+    addSystemLog(`正在将本地目录 [${dirPath}] 绑定至远程 [${repo.fullName}] 的 [${branchName}] 分支...`);
+    const res = await apiPost('/api/repo/bind', {
+      dirPath,
+      remoteUrl: repo.htmlUrl,
+      branch: branchName
     });
+
+    if (res.success) {
+      addSystemLog(`成功关联绑定到 [${repo.fullName}] 的 [${branchName}] 分支`);
+      loadProjectPath(dirPath);
+      delete repoBranchesCache[repo.fullName]; // Clear branch cache to refresh status
+      fetchGithubRepos();
+    } else {
+      addSystemLog(`关联绑定失败: ${res.error}`);
+      await showCustomDialog({
+        title: '绑定失败',
+        message: `无法将本地文件夹与远程分支绑定，原因: ${res.error}`,
+        confirmText: '关闭'
+      });
+    }
+  } finally {
+    isBindingInProgress = false;
   }
 }
 
@@ -1328,6 +1340,11 @@ btnRefreshChanges.addEventListener('click', () => {
 
 // Commit and force push button
 btnCommitPush.addEventListener('click', async () => {
+  if (isCommitInProgress) {
+    addSystemLog('已有提交推送操作正在执行，请稍候。');
+    return;
+  }
+
   const dirPath = pathInput.value.trim();
   const desc = commitDescInput.value.trim();
 
@@ -1348,27 +1365,44 @@ btnCommitPush.addEventListener('click', async () => {
   }
 
   addSystemLog(`开始提交并强制推送至远程分支 [${selectedBranch}]...`);
+  isCommitInProgress = true;
   btnCommitPush.disabled = true;
   btnCommitPush.innerText = '正在提交并推送...';
 
-  const res = await apiPost('/api/repo/commit', {
-    dirPath,
-    branch: selectedBranch,
-    description: desc
-  });
+  try {
+    const res = await apiPost('/api/repo/commit', {
+      dirPath,
+      branch: selectedBranch,
+      description: desc
+    });
 
-  btnCommitPush.disabled = false;
-  btnCommitPush.innerHTML = COMMIT_BUTTON_HTML;
-  lucide.createIcons();
+    if (res.success) {
+      const pushSeconds = typeof res.pushDurationMs === 'number'
+        ? (res.pushDurationMs / 1000).toFixed(1)
+        : '';
+      const totalSeconds = typeof res.totalDurationMs === 'number'
+        ? (res.totalDurationMs / 1000).toFixed(1)
+        : '';
+      const hashText = res.commitHash ? `，提交 ${res.commitHash}` : '';
+      const timeText = pushSeconds ? `，推送耗时 ${pushSeconds}s，总耗时 ${totalSeconds}s` : '';
+      addSystemLog(`远程推送已完成${hashText}${timeText}。正在刷新本地状态和历史记录...`);
 
-  if (res.success) {
-    addSystemLog(`成功提交并强推至 [${selectedBranch}]`);
-    commitDescInput.value = '';
-    selectedCommitHash = '';
-    await refreshLocalChanges();
-    await loadCommitHistory();
-  } else {
-    addSystemLog(`提交失败: ${res.error}`);
+      btnCommitPush.innerText = '推送完成，正在刷新...';
+      commitDescInput.value = '';
+      selectedCommitHash = '';
+      await Promise.all([
+        refreshLocalChanges(),
+        loadCommitHistory()
+      ]);
+      addSystemLog(`界面刷新完成。`);
+    } else {
+      addSystemLog(`提交失败: ${res.error}`);
+    }
+  } finally {
+    isCommitInProgress = false;
+    btnCommitPush.disabled = false;
+    btnCommitPush.innerHTML = COMMIT_BUTTON_HTML;
+    lucide.createIcons();
   }
 });
 
