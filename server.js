@@ -229,6 +229,48 @@ function normalizeRemoteUrl(remoteUrl) {
   return cleanRemoteUrl;
 }
 
+function parseGithubFullName(fullName) {
+  if (typeof fullName !== 'string' || !fullName.trim()) return null;
+  const match = fullName.trim().match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
+  if (!match) return null;
+  return {
+    owner: match[1],
+    repo: match[2],
+    fullName: `${match[1]}/${match[2]}`
+  };
+}
+
+function parseGithubRemoteUrl(remoteUrl) {
+  if (typeof remoteUrl !== 'string' || !remoteUrl.trim()) return null;
+  const raw = remoteUrl.trim().replace(/[?#].*$/, '').replace(/[\\/]+$/, '');
+  const sshMatch = raw.match(/^(?:[^@\s]+@)?github\.com:([^\/\s]+)\/([^\/\s]+?)(?:\.git)?$/i);
+
+  if (sshMatch) {
+    return parseGithubFullName(`${sshMatch[1]}/${sshMatch[2]}`);
+  }
+
+  try {
+    const parsedUrl = new URL(raw);
+    if (parsedUrl.hostname.toLowerCase() !== 'github.com') return null;
+
+    const parts = parsedUrl.pathname
+      .replace(/^\/+|\/+$/g, '')
+      .split('/')
+      .filter(Boolean);
+
+    if (parts.length !== 2) return null;
+    const owner = decodeURIComponent(parts[0]);
+    const repo = decodeURIComponent(parts[1]).replace(/\.git$/i, '');
+    return parseGithubFullName(`${owner}/${repo}`);
+  } catch (err) {
+    return null;
+  }
+}
+
+function sameGithubRepository(left, right) {
+  return !!left && !!right && left.fullName.toLowerCase() === right.fullName.toLowerCase();
+}
+
 async function getGitRepositoryRoot(cwd, token = '') {
   const result = await runCommand(cwd, ['rev-parse', '--show-toplevel'], token);
   return result.success ? path.resolve(result.stdout.trim()) : '';
@@ -513,6 +555,80 @@ async function callGithubApi(method, apiPath, body, token) {
   }
 }
 
+async function getAuthenticatedGithubLogin(token) {
+  if (!token) {
+    return { success: false, statusCode: 401, error: 'GitHub Token 未关联，请先在右上角配置 Token。' };
+  }
+
+  const apiRes = await callGithubApi('GET', '/user', null, token);
+  if (!apiRes.success) {
+    return {
+      success: false,
+      statusCode: apiRes.statusCode || 502,
+      error: `无法确认当前 GitHub Token 所属账号: ${apiRes.error}`
+    };
+  }
+
+  const login = apiRes.data && apiRes.data.login;
+  if (typeof login !== 'string' || !login.trim()) {
+    return { success: false, statusCode: 502, error: 'GitHub API 未返回当前 Token 所属账号。' };
+  }
+
+  return { success: true, login: login.trim() };
+}
+
+async function validateGithubWriteTarget({ cwd, remoteUrl, expectedFullName = '', token }) {
+  let targetRemoteUrl = remoteUrl;
+
+  if (!targetRemoteUrl && cwd) {
+    const remoteResult = await runCommand(cwd, ['remote', 'get-url', 'origin'], token);
+    if (!remoteResult.success) {
+      return {
+        success: false,
+        statusCode: 400,
+        error: '无法读取当前仓库 origin，已阻止远程写入。请先绑定自己的 GitHub 仓库。'
+      };
+    }
+    targetRemoteUrl = remoteResult.stdout;
+  }
+
+  const targetRepo = parseGithubRemoteUrl(targetRemoteUrl);
+  if (!targetRepo) {
+    return {
+      success: false,
+      statusCode: 400,
+      error: `origin 不是有效的 GitHub 仓库地址，已阻止远程写入: ${maskSensitiveLog(targetRemoteUrl || '', token)}`
+    };
+  }
+
+  if (expectedFullName) {
+    const expectedRepo = parseGithubFullName(expectedFullName);
+    if (!expectedRepo) {
+      return { success: false, statusCode: 400, error: '页面传入的目标仓库标识无效，已阻止远程写入。' };
+    }
+    if (!sameGithubRepository(targetRepo, expectedRepo)) {
+      return {
+        success: false,
+        statusCode: 409,
+        error: `当前 origin 指向 [${targetRepo.fullName}]，但页面选中的仓库是 [${expectedRepo.fullName}]。请刷新状态或重新绑定后再提交。`
+      };
+    }
+  }
+
+  const loginResult = await getAuthenticatedGithubLogin(token);
+  if (!loginResult.success) return loginResult;
+
+  if (targetRepo.owner.toLowerCase() !== loginResult.login.toLowerCase()) {
+    return {
+      success: false,
+      statusCode: 403,
+      error: `已阻止写入仓库 [${targetRepo.fullName}]：当前 GitHub Token 属于 [${loginResult.login}]，目标仓库 owner 是 [${targetRepo.owner}]。为避免误提交到他人或组织仓库，只允许写入当前 Token 用户自己的仓库。`
+    };
+  }
+
+  return { success: true, repo: targetRepo, login: loginResult.login };
+}
+
 function normalizeChatCompletionsUrl(rawUrl) {
   const defaultUrl = 'http://localhost:11434/v1/chat/completions';
   const value = typeof rawUrl === 'string' && rawUrl.trim() ? rawUrl.trim() : defaultUrl;
@@ -647,7 +763,7 @@ app.post('/api/repo/status', async (req, res) => {
 
 // Initialize Git Repository & Link remote
 app.post('/api/repo/init', async (req, res) => {
-  const { dirPath, remoteUrl } = req.body;
+  const { dirPath, remoteUrl, expectedRepoFullName } = req.body;
   const safeDir = resolveExistingDirectory(dirPath);
   if (!safeDir) {
     return res.status(400).json({ success: false, error: 'Directory does not exist.' });
@@ -662,6 +778,14 @@ app.post('/api/repo/init', async (req, res) => {
   }
 
   const cleanRemoteUrl = normalizeRemoteUrl(remoteUrl);
+  const targetValidation = await validateGithubWriteTarget({
+    remoteUrl: cleanRemoteUrl,
+    expectedFullName: expectedRepoFullName,
+    token
+  });
+  if (!targetValidation.success) {
+    return res.status(targetValidation.statusCode || 400).json({ success: false, error: targetValidation.error });
+  }
 
   const isRepo = await isGitRepository(safeDir, token);
 
@@ -770,7 +894,7 @@ app.post('/api/repo/history', async (req, res) => {
 
 // Commit and Force Push
 app.post('/api/repo/commit', async (req, res) => {
-  const { dirPath, branch, description } = req.body;
+  const { dirPath, branch, description, expectedRepoFullName } = req.body;
   const operationStartedAt = Date.now();
   const config = loadConfig();
   const token = config.githubToken || '';
@@ -790,6 +914,15 @@ app.post('/api/repo/commit', async (req, res) => {
   const branchValidation = await validateBranchName(safeDir, branch, token);
   if (!branchValidation.success) {
     return res.status(400).json({ success: false, error: branchValidation.error });
+  }
+
+  const targetValidation = await validateGithubWriteTarget({
+    cwd: safeDir,
+    expectedFullName: expectedRepoFullName,
+    token
+  });
+  if (!targetValidation.success) {
+    return res.status(targetValidation.statusCode || 400).json({ success: false, error: targetValidation.error });
   }
 
   const currentBranchRes = await runCommand(safeDir, ['branch', '--show-current'], token);
@@ -878,7 +1011,7 @@ app.post('/api/repo/switch', async (req, res) => {
 
 // Create branch
 app.post('/api/repo/create-branch', async (req, res) => {
-  const { dirPath, newBranchName, fromHash } = req.body;
+  const { dirPath, newBranchName, fromHash, expectedRepoFullName } = req.body;
   const config = loadConfig();
   const token = config.githubToken || '';
   const repoCheck = await resolveOwnGitRepository(dirPath, token);
@@ -894,6 +1027,15 @@ app.post('/api/repo/create-branch', async (req, res) => {
   const branchValidation = await validateBranchName(safeDir, newBranchName, token);
   if (!branchValidation.success) {
     return res.status(400).json({ success: false, error: branchValidation.error });
+  }
+
+  const targetValidation = await validateGithubWriteTarget({
+    cwd: safeDir,
+    expectedFullName: expectedRepoFullName,
+    token
+  });
+  if (!targetValidation.success) {
+    return res.status(targetValidation.statusCode || 400).json({ success: false, error: targetValidation.error });
   }
 
   // Check if HEAD exists (i.e. has commits)
@@ -945,7 +1087,7 @@ app.post('/api/repo/create-branch', async (req, res) => {
 
 // Delete remote branch
 app.post('/api/repo/delete-branch', async (req, res) => {
-  const { dirPath, branchToDelete } = req.body;
+  const { dirPath, branchToDelete, expectedRepoFullName } = req.body;
   const config = loadConfig();
   const token = config.githubToken || '';
   const repoCheck = await resolveOwnGitRepository(dirPath, token);
@@ -961,6 +1103,15 @@ app.post('/api/repo/delete-branch', async (req, res) => {
   const branchValidation = await validateBranchName(safeDir, branchToDelete, token);
   if (!branchValidation.success) {
     return res.status(400).json({ success: false, error: branchValidation.error });
+  }
+
+  const targetValidation = await validateGithubWriteTarget({
+    cwd: safeDir,
+    expectedFullName: expectedRepoFullName,
+    token
+  });
+  if (!targetValidation.success) {
+    return res.status(targetValidation.statusCode || 400).json({ success: false, error: targetValidation.error });
   }
 
   const currentBranchRes = await runCommand(safeDir, ['branch', '--show-current'], token);
@@ -994,7 +1145,7 @@ app.post('/api/repo/delete-branch', async (req, res) => {
 
 // Reset branch to commit hash
 app.post('/api/repo/reset', async (req, res) => {
-  const { dirPath, branch, hash } = req.body;
+  const { dirPath, branch, hash, expectedRepoFullName } = req.body;
   const config = loadConfig();
   const token = config.githubToken || '';
   const repoCheck = await resolveOwnGitRepository(dirPath, token);
@@ -1014,6 +1165,15 @@ app.post('/api/repo/reset', async (req, res) => {
   const commitValidation = await validateCommitRef(safeDir, hash, token);
   if (!commitValidation.success) {
     return res.status(400).json({ success: false, error: commitValidation.error });
+  }
+
+  const targetValidation = await validateGithubWriteTarget({
+    cwd: safeDir,
+    expectedFullName: expectedRepoFullName,
+    token
+  });
+  if (!targetValidation.success) {
+    return res.status(targetValidation.statusCode || 400).json({ success: false, error: targetValidation.error });
   }
 
   const checkoutRes = await runCommand(safeDir, ['checkout', branch], token);
@@ -1044,18 +1204,25 @@ app.get('/api/github/repos', async (req, res) => {
     return res.json({ success: false, error: 'GitHub 账号未登录，请先在右上角配置 Token' });
   }
 
+  const loginResult = await getAuthenticatedGithubLogin(token);
+  if (!loginResult.success) {
+    return res.status(loginResult.statusCode || 400).json({ success: false, error: loginResult.error });
+  }
+
   // Fetch up to 100 repositories, sorted by last updated
   const apiRes = await callGithubApi('GET', '/user/repos?sort=updated&per_page=100', null, token);
   if (apiRes.success) {
-    const repos = apiRes.data.map(repo => ({
-      name: repo.name,
-      fullName: repo.full_name,
-      owner: repo.owner.login,
-      private: repo.private,
-      htmlUrl: repo.html_url,
-      defaultBranch: repo.default_branch,
-      description: repo.description // Return description
-    }));
+    const repos = apiRes.data
+      .filter(repo => repo.owner && repo.owner.login && repo.owner.login.toLowerCase() === loginResult.login.toLowerCase())
+      .map(repo => ({
+        name: repo.name,
+        fullName: repo.full_name,
+        owner: repo.owner.login,
+        private: repo.private,
+        htmlUrl: repo.html_url,
+        defaultBranch: repo.default_branch,
+        description: repo.description // Return description
+      }));
     res.json({ success: true, repos });
   } else {
     res.json({ success: false, error: apiRes.error });
@@ -1138,6 +1305,17 @@ app.post('/api/github/repos/delete', async (req, res) => {
     return res.status(400).json({ success: false, error: '参数所有者和仓库名均不能为空' });
   }
 
+  const loginResult = await getAuthenticatedGithubLogin(token);
+  if (!loginResult.success) {
+    return res.status(loginResult.statusCode || 400).json({ success: false, error: loginResult.error });
+  }
+  if (owner.toLowerCase() !== loginResult.login.toLowerCase()) {
+    return res.status(403).json({
+      success: false,
+      error: `已阻止删除仓库 [${owner}/${repo}]：当前 GitHub Token 属于 [${loginResult.login}]，目标仓库 owner 是 [${owner}]。`
+    });
+  }
+
   const apiRes = await callGithubApi('DELETE', `/repos/${owner}/${repo}`, null, token);
   if (apiRes.success) {
     res.json({ success: true });
@@ -1170,7 +1348,7 @@ app.post('/api/github/repos/branches', async (req, res) => {
 
 // Bind physical directory to repository and checkout/push target branch
 app.post('/api/repo/bind', async (req, res) => {
-  const { dirPath, remoteUrl, branch } = req.body;
+  const { dirPath, remoteUrl, branch, expectedRepoFullName } = req.body;
   const safeDir = resolveExistingDirectory(dirPath);
   if (!safeDir) {
     return res.status(400).json({ success: false, error: '本地物理路径不存在' });
@@ -1188,6 +1366,14 @@ app.post('/api/repo/bind', async (req, res) => {
   }
 
   const cleanRemoteUrl = normalizeRemoteUrl(remoteUrl);
+  const targetValidation = await validateGithubWriteTarget({
+    remoteUrl: cleanRemoteUrl,
+    expectedFullName: expectedRepoFullName,
+    token
+  });
+  if (!targetValidation.success) {
+    return res.status(targetValidation.statusCode || 400).json({ success: false, error: targetValidation.error });
+  }
 
   const isRepo = await isGitRepository(safeDir, token);
 
