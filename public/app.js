@@ -495,7 +495,8 @@ repoSelect.addEventListener('change', async () => {
         addSystemLog(`检测到本地路径 [${dirPath}] 需要配置远程关联。正在自动初始化并关联至远程仓库 [${match.fullName}]...`);
         const initRes = await apiPost('/api/repo/init', {
           dirPath,
-          remoteUrl: match.htmlUrl
+          remoteUrl: match.htmlUrl,
+          expectedRepoFullName: match.fullName
         });
         if (initRes.success) {
           addSystemLog(`自动配置关联成功。`);
@@ -581,7 +582,11 @@ function populateBranchesUI(repo, branches) {
           addSystemLog(`正在删除 [${repo.fullName}] 的远程分支: ${branch}...`);
           const localPath = pathInput.value.trim();
           if (localPath && isMatchingRemote(currentRepoStatus.remoteUrl, repo.fullName)) {
-            const delRes = await apiPost('/api/repo/delete-branch', { dirPath: localPath, branchToDelete: branch });
+            const delRes = await apiPost('/api/repo/delete-branch', {
+              dirPath: localPath,
+              branchToDelete: branch,
+              expectedRepoFullName: repo.fullName
+            });
             if (delRes.success) {
               addSystemLog(`分支 [${branch}] 已成功删除`);
               delete repoBranchesCache[repo.fullName]; // Clear cache
@@ -621,6 +626,10 @@ function isMatchingRemote(url, fullName) {
   const cleanRemote = stripGit(cleanUrl);
 
   return cleanRemote.includes(`github.com/${cleanTarget}`) || cleanRemote.includes(`github.com:${cleanTarget}`);
+}
+
+function getExpectedRepoFullName() {
+  return activeSelectedRepo ? activeSelectedRepo.fullName : '';
 }
 
 // Bind local directory to repository and branch
@@ -680,7 +689,8 @@ async function bindLocalDirectoryToBranch(repo, branchName) {
     const res = await apiPost('/api/repo/bind', {
       dirPath,
       remoteUrl: repo.htmlUrl,
-      branch: branchName
+      branch: branchName,
+      expectedRepoFullName: repo.fullName
     });
 
     if (res.success) {
@@ -813,7 +823,8 @@ async function loadProjectPath(dirPath, isRetry = false) {
         addSystemLog(`检测到本地路径 [${absolutePath}] 需要配置远程关联。正在自动初始化并关联至远程仓库 [${activeSelectedRepo.fullName}]...`);
         const initRes = await apiPost('/api/repo/init', {
           dirPath: absolutePath,
-          remoteUrl: activeSelectedRepo.htmlUrl
+          remoteUrl: activeSelectedRepo.htmlUrl,
+          expectedRepoFullName: activeSelectedRepo.fullName
         });
         if (requestSeq !== repoStatusRequestSeq) return;
         if (initRes.success) {
@@ -1314,7 +1325,12 @@ async function resetToCommit(hash) {
 
   if (confirmReset) {
     addSystemLog(`正在重置当前分支至 ${hash}...`);
-    const resetRes = await apiPost('/api/repo/reset', { dirPath, branch: selectedBranch, hash });
+    const resetRes = await apiPost('/api/repo/reset', {
+      dirPath,
+      branch: selectedBranch,
+      hash,
+      expectedRepoFullName: getExpectedRepoFullName()
+    });
     if (resetRes.success) {
       addSystemLog(`重置成功。远程仓库已回滚至 ${hash}`);
       selectedCommitHash = '';
@@ -1340,7 +1356,12 @@ async function createBranchFromHash(hash) {
   }
 
   addSystemLog(`正在以提交 [${hash}] 为基准创建新远程分支 [${cleanName}]...`);
-  const res = await apiPost('/api/repo/create-branch', { dirPath, newBranchName: cleanName, fromHash: hash });
+  const res = await apiPost('/api/repo/create-branch', {
+    dirPath,
+    newBranchName: cleanName,
+    fromHash: hash,
+    expectedRepoFullName: getExpectedRepoFullName()
+  });
   
   if (res.success) {
     addSystemLog(`新分支 [${cleanName}] 创建并推送成功，已自动切换至新分支`);
@@ -1362,7 +1383,11 @@ async function performBranchCreation(cleanName) {
   if (!dirPath) return;
 
   addSystemLog(`正在创建并同步推送新分支 [${cleanName}]...`);
-  const res = await apiPost('/api/repo/create-branch', { dirPath, newBranchName: cleanName });
+  const res = await apiPost('/api/repo/create-branch', {
+    dirPath,
+    newBranchName: cleanName,
+    expectedRepoFullName: getExpectedRepoFullName()
+  });
   if (res.success) {
     addSystemLog(`新分支 [${cleanName}] 创建并同步远程成功，已自动切换至新分支`);
     
@@ -1453,7 +1478,8 @@ btnCommitPush.addEventListener('click', async () => {
     const res = await apiPost('/api/repo/commit', {
       dirPath,
       branch: selectedBranch,
-      description: desc
+      description: desc,
+      expectedRepoFullName: getExpectedRepoFullName()
     });
 
     if (res.success) {
