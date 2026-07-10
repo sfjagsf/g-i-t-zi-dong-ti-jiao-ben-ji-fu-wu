@@ -33,6 +33,8 @@ const PROTECTED_PROJECT_PATH_MESSAGE = '已阻止操作 GFlow 工具自身目录
 let globalReposList = [];
 let repoBranchesCache = {}; // { repoFullName: [branches] }
 let activeSelectedRepo = null; // Currently active selected repository object from dropdown
+let defaultBranchBindingPromptKey = '';
+let isDefaultBranchBindingPromptInProgress = false;
 
 // DOM elements
 const pathInput = document.getElementById('project-path');
@@ -632,6 +634,57 @@ function getExpectedRepoFullName() {
   return activeSelectedRepo ? activeSelectedRepo.fullName : '';
 }
 
+async function getRemoteBranchesForBinding(repo) {
+  if (Array.isArray(repoBranchesCache[repo.fullName])) {
+    return repoBranchesCache[repo.fullName];
+  }
+
+  const res = await apiPost('/api/github/repos/branches', { owner: repo.owner, repo: repo.name });
+  if (!res.success) return [];
+
+  repoBranchesCache[repo.fullName] = res.branches;
+  return res.branches;
+}
+
+async function offerDefaultBranchBinding(absolutePath) {
+  const repo = activeSelectedRepo;
+  const currentBranch = currentRepoStatus.currentBranch;
+  if (!repo || !currentBranch || isBindingInProgress || isDefaultBranchBindingPromptInProgress) return false;
+
+  const branches = await getRemoteBranchesForBinding(repo);
+  if (branches.includes(currentBranch)) return false;
+
+  const defaultBranch = branches.includes(repo.defaultBranch)
+    ? repo.defaultBranch
+    : branches[0];
+  if (!defaultBranch || defaultBranch === currentBranch) return false;
+
+  const promptKey = `${absolutePath}|${repo.fullName}|${currentBranch}|${defaultBranch}`;
+  if (defaultBranchBindingPromptKey === promptKey) return false;
+
+  defaultBranchBindingPromptKey = promptKey;
+  isDefaultBranchBindingPromptInProgress = true;
+  try {
+    const shouldBind = await showCustomDialog({
+      title: '检测到复制的 Git 分支',
+      message: `当前本地分支 [${currentBranch}] 不存在于远程仓库 [${repo.fullName}]。这通常是复制项目时保留 .git 目录造成的。是否改为绑定远程默认分支 [${defaultBranch}]？原本地分支会保留，不会自动上传代码。`,
+      confirmText: `绑定 ${defaultBranch}`,
+      cancelText: '暂不绑定',
+      isDanger: true
+    });
+
+    if (shouldBind) {
+      await bindLocalDirectoryToBranch(repo, defaultBranch);
+      return true;
+    } else {
+      addSystemLog(`已保留本地分支 [${currentBranch}]，未绑定远程默认分支 [${defaultBranch}]。`);
+      return false;
+    }
+  } finally {
+    isDefaultBranchBindingPromptInProgress = false;
+  }
+}
+
 // Bind local directory to repository and branch
 async function bindLocalDirectoryToBranch(repo, branchName) {
   if (isBindingInProgress) {
@@ -694,7 +747,10 @@ async function bindLocalDirectoryToBranch(repo, branchName) {
     });
 
     if (res.success) {
-      addSystemLog(`成功关联绑定到 [${repo.fullName}] 的 [${branchName}] 分支`);
+      const bindMessage = res.pendingPush
+        ? `已关联到 [${repo.fullName}] 的本地 [${branchName}] 分支，尚未上传代码。请确认改动后点击“提交并推送”。`
+        : `成功关联绑定到 [${repo.fullName}] 的 [${branchName}] 分支`;
+      addSystemLog(bindMessage);
       delete repoBranchesCache[repo.fullName]; // Clear branch cache to refresh status
       await loadProjectPath(dirPath);
       await fetchGithubRepos();
@@ -837,7 +893,11 @@ async function loadProjectPath(dirPath, isRetry = false) {
       }
     }
 
-    updateLocalRepoUi(statusRes, absolutePath);
+    updateLocalRepoUi(statusRes, absolutePath, { refreshHistory: false });
+    const bindingStarted = await offerDefaultBranchBinding(absolutePath);
+    if (!bindingStarted && selectedBranch) {
+      loadCommitHistory();
+    }
   } else {
     addSystemLog(`加载仓库状态出错: ${statusRes.error}`);
   }
@@ -1101,7 +1161,10 @@ async function loadCommitHistory() {
     const commits = res.commits;
 
     if (commits.length === 0) {
-      historyContent.innerHTML = '<div class="empty-state-text">此分支没有历史提交</div>';
+      const emptyMessage = res.remoteBranchExists === false
+        ? '远程分支尚不存在，尚未推送任何提交'
+        : '此分支没有历史提交';
+      historyContent.innerHTML = `<div class="empty-state-text">${emptyMessage}</div>`;
       return;
     }
 
@@ -1341,6 +1404,19 @@ async function resetToCommit(hash) {
   }
 }
 
+function getBuildOutputLogText(ignoredBuildOutputs) {
+  if (!ignoredBuildOutputs || !ignoredBuildOutputs.applied) return '';
+
+  const details = [];
+  if (ignoredBuildOutputs.gitignoreUpdated) {
+    details.push('已自动补充 .gitignore。');
+  }
+  if (ignoredBuildOutputs.removedTrackedBuildFiles > 0) {
+    details.push(`已排除 ${ignoredBuildOutputs.removedTrackedBuildFiles} 个已跟踪编译文件。`);
+  }
+  return details.join('');
+}
+
 // Create new branch from hash (history timeline)
 async function createBranchFromHash(hash) {
   const dirPath = pathInput.value.trim();
@@ -1364,7 +1440,7 @@ async function createBranchFromHash(hash) {
   });
   
   if (res.success) {
-    addSystemLog(`新分支 [${cleanName}] 创建并推送成功，已自动切换至新分支`);
+    addSystemLog(`新分支 [${cleanName}] 创建并推送成功，已自动切换至新分支。${getBuildOutputLogText(res.ignoredBuildOutputs)}`);
     selectedCommitHash = '';
     
     loadProjectPath(dirPath);
@@ -1389,7 +1465,7 @@ async function performBranchCreation(cleanName) {
     expectedRepoFullName: getExpectedRepoFullName()
   });
   if (res.success) {
-    addSystemLog(`新分支 [${cleanName}] 创建并同步远程成功，已自动切换至新分支`);
+    addSystemLog(`新分支 [${cleanName}] 创建并同步远程成功，已自动切换至新分支。${getBuildOutputLogText(res.ignoredBuildOutputs)}`);
     
     loadProjectPath(dirPath);
     if (activeSelectedRepo) {
@@ -1491,7 +1567,8 @@ btnCommitPush.addEventListener('click', async () => {
         : '';
       const hashText = res.commitHash ? `，提交 ${res.commitHash}` : '';
       const timeText = pushSeconds ? `，推送耗时 ${pushSeconds}s，总耗时 ${totalSeconds}s` : '';
-      addSystemLog(`远程推送已完成${hashText}${timeText}。正在刷新本地状态和历史记录...`);
+      const buildOutputText = getBuildOutputLogText(res.ignoredBuildOutputs);
+      addSystemLog(`远程推送已完成${hashText}${timeText}。${buildOutputText}正在刷新本地状态和历史记录...`);
 
       btnCommitPush.innerText = '推送完成，正在刷新...';
       commitDescInput.value = '';
@@ -1543,6 +1620,7 @@ btnOpenCreateRepo.addEventListener('click', () => {
     return;
   }
   newRepoName.value = '';
+  newRepoInit.checked = false;
   createRepoModal.classList.remove('hidden');
 });
 

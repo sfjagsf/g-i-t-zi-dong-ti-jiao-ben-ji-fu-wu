@@ -394,6 +394,79 @@ async function checkoutOrCreateLocalBranch(cwd, branch, token = '') {
   return runCommand(cwd, ['symbolic-ref', 'HEAD', `refs/heads/${branch}`], token);
 }
 
+const STM32_BUILD_OUTPUT_IGNORE_RULES = [
+  '# GFlow: STM32/CubeIDE generated build output',
+  '/Debug/',
+  '/Release/',
+  '*.elf',
+  '*.hex',
+  '*.bin',
+  '*.map',
+  '*.list',
+  '*.o',
+  '*.d',
+  '*.su',
+  '*.cyclo'
+];
+
+function isStm32CubeIdeProject(cwd) {
+  if (
+    fs.existsSync(path.join(cwd, '.cproject')) ||
+    fs.existsSync(path.join(cwd, 'Debug')) ||
+    fs.existsSync(path.join(cwd, 'Release'))
+  ) return true;
+
+  try {
+    return fs.readdirSync(cwd, { withFileTypes: true })
+      .some(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.ioc'));
+  } catch (err) {
+    return false;
+  }
+}
+
+function ensureGitignoreRules(cwd, rules) {
+  const gitignorePath = path.join(cwd, '.gitignore');
+  const existing = fs.existsSync(gitignorePath) ? fs.readFileSync(gitignorePath, 'utf8') : '';
+  const existingLines = new Set(existing.split(/\r?\n/).map(line => line.trim()));
+  const missingRules = rules.filter(rule => !existingLines.has(rule));
+
+  if (missingRules.length === 0) return false;
+
+  const prefix = existing && !existing.endsWith('\n') ? '\n' : '';
+  const separator = existing ? '\n' : '';
+  fs.writeFileSync(gitignorePath, `${existing}${prefix}${separator}${missingRules.join('\n')}\n`, 'utf8');
+  return true;
+}
+
+async function prepareStm32BuildOutputsForCommit(cwd, token = '') {
+  if (!isStm32CubeIdeProject(cwd)) {
+    return { success: true, applied: false, gitignoreUpdated: false, removedTrackedBuildFiles: 0 };
+  }
+
+  const gitignoreUpdated = ensureGitignoreRules(cwd, STM32_BUILD_OUTPUT_IGNORE_RULES);
+  const trackedRes = await runCommand(cwd, ['ls-files', '-z', '--', 'Debug', 'Release'], token, {
+    logOutput: false,
+    trimOutput: false
+  });
+  const trackedBuildFiles = trackedRes.success
+    ? trackedRes.stdout.split('\0').filter(Boolean)
+    : [];
+
+  if (trackedBuildFiles.length > 0) {
+    const untrackRes = await runCommand(cwd, ['rm', '-r', '--cached', '--ignore-unmatch', '--', 'Debug', 'Release'], token);
+    if (!untrackRes.success) {
+      return { success: false, error: 'Failed to remove tracked build output: ' + untrackRes.error };
+    }
+  }
+
+  return {
+    success: true,
+    applied: true,
+    gitignoreUpdated,
+    removedTrackedBuildFiles: trackedBuildFiles.length
+  };
+}
+
 async function validateBranchName(cwd, branch, token = '') {
   if (typeof branch !== 'string' || !branch.trim() || branch !== branch.trim() || branch.startsWith('-')) {
     return { success: false, error: 'Invalid branch name.' };
@@ -808,6 +881,10 @@ app.post('/api/repo/init', async (req, res) => {
     return res.json({ success: false, error: 'Failed to configure remote: ' + setRemoteRes.error });
   }
 
+  // Changing origin does not remove old origin/* refs. Prune them against the new remote
+  // so stale history from the previous repository cannot be displayed as current history.
+  await runCommand(safeDir, ['remote', 'prune', 'origin'], token);
+
   await runCommand(safeDir, ['config', 'user.name', 'GitHub Auto Tool'], token);
   await runCommand(safeDir, ['config', 'user.email', 'autotool@github.com'], token);
 
@@ -863,7 +940,18 @@ app.post('/api/repo/history', async (req, res) => {
     return res.status(400).json({ success: false, error: branchValidation.error });
   }
 
-  await runCommand(safeDir, ['fetch', 'origin', branch], token);
+  const fetchRes = await runCommand(safeDir, ['fetch', 'origin', branch], token);
+  if (!fetchRes.success) {
+    if (fetchRes.error.includes("couldn't find remote ref")) {
+      return res.json({ success: true, commits: [], remoteBranchExists: false });
+    }
+    return res.json({ success: false, error: 'Failed to fetch remote history: ' + fetchRes.error });
+  }
+
+  // Never fall back to an old local origin/<branch> reference after a remote URL changes.
+  if (!await remoteBranchExists(safeDir, branch, token)) {
+    return res.json({ success: true, commits: [], remoteBranchExists: false });
+  }
 
   const logRes = await runCommand(
     safeDir,
@@ -872,7 +960,7 @@ app.post('/api/repo/history', async (req, res) => {
   );
 
   if (!logRes.success) {
-    return res.json({ success: true, commits: [] });
+    return res.json({ success: true, commits: [], remoteBranchExists: true });
   }
 
   const commits = logRes.stdout.split('\n')
@@ -889,7 +977,7 @@ app.post('/api/repo/history', async (req, res) => {
       }
     });
 
-  res.json({ success: true, commits });
+  res.json({ success: true, commits, remoteBranchExists: true });
 });
 
 // Commit and Force Push
@@ -933,6 +1021,11 @@ app.post('/api/repo/commit', async (req, res) => {
     return res.json({ success: false, error: `当前工作区分支是 [${currentBranchRes.stdout.trim()}]，不是页面选中的 [${branch}]。请刷新后重试。` });
   }
 
+  const buildOutputResult = await prepareStm32BuildOutputsForCommit(safeDir, token);
+  if (!buildOutputResult.success) {
+    return res.json({ success: false, error: buildOutputResult.error });
+  }
+
   const addRes = await runCommand(safeDir, ['add', '-A'], token);
   if (!addRes.success) {
     return res.json({ success: false, error: 'Failed to stage changes: ' + addRes.error });
@@ -954,6 +1047,7 @@ app.post('/api/repo/commit', async (req, res) => {
   res.json({
     success: true,
     commitHash: headRes.success ? headRes.stdout : '',
+    ignoredBuildOutputs: buildOutputResult,
     pushDurationMs,
     totalDurationMs: Date.now() - operationStartedAt
   });
@@ -1070,6 +1164,11 @@ app.post('/api/repo/create-branch', async (req, res) => {
     }
   }
 
+  const buildOutputResult = await prepareStm32BuildOutputsForCommit(safeDir, token);
+  if (!buildOutputResult.success) {
+    return res.json({ success: false, error: buildOutputResult.error });
+  }
+
   // 2. Stage all modifications
   await runCommand(safeDir, ['add', '-A'], token);
 
@@ -1082,7 +1181,7 @@ app.post('/api/repo/create-branch', async (req, res) => {
     return res.json({ success: false, error: 'Failed to push branch to remote: ' + pushRes.error });
   }
 
-  res.json({ success: true });
+  res.json({ success: true, ignoredBuildOutputs: buildOutputResult });
 });
 
 // Delete remote branch
@@ -1402,6 +1501,10 @@ app.post('/api/repo/bind', async (req, res) => {
     return res.json({ success: false, error: '配置 Remote 关联失败: ' + setRemoteRes.error });
   }
 
+  // A repository may have been connected to another origin before this binding.
+  // Remove stale origin/* references before inspecting branches from the new repository.
+  await runCommand(safeDir, ['remote', 'prune', 'origin'], token);
+
   // 3. Fetch from remote
   const fetchRes = await runCommand(safeDir, ['fetch', 'origin', branch], token);
 
@@ -1415,30 +1518,13 @@ app.post('/api/repo/bind', async (req, res) => {
   } else if (!fetchRes.success && !fetchRes.error.includes('couldn\'t find remote ref')) {
     return res.json({ success: false, error: '拉取远程分支失败: ' + fetchRes.error });
   } else {
-    // Branch does NOT exist remotely. Let's create it locally and push to remote.
-    // Check if we already have files in the folder. If so, stage & commit them.
-    // If not, commit an empty commit.
+    // Branch does not exist remotely. Create or switch to the local branch only.
+    // Uploading source code must remain an explicit action through /api/repo/commit.
     const checkoutNewRes = await checkoutOrCreateLocalBranch(safeDir, branch, token);
     if (!checkoutNewRes.success) {
       return res.json({ success: false, error: '本地新建分支失败: ' + checkoutNewRes.error });
     }
-
-    // Check status
-    const statusRes = await runCommand(safeDir, ['status', '--porcelain'], token);
-    if (statusRes.stdout.length > 0) {
-      // Stage & Commit
-      await runCommand(safeDir, ['add', '-A'], token);
-      await runCommand(safeDir, ['commit', '-m', `Initial commit on new branch ${branch}`], token);
-    } else {
-      // Empty commit so there's a HEAD history to push
-      await runCommand(safeDir, ['commit', '--allow-empty', '-m', `Initial commit on new branch ${branch}`], token);
-    }
-
-    // Push it
-    const pushNewRes = await runCommand(safeDir, ['push', '-u', 'origin', branch], token);
-    if (!pushNewRes.success) {
-      return res.json({ success: false, error: '推送新分支到远程失败: ' + pushNewRes.error });
-    }
+    return res.json({ success: true, pendingPush: true });
   }
 
   res.json({ success: true });
