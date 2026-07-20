@@ -525,6 +525,176 @@ async function getDiffIncludingUntracked(cwd, token = '', maxChars = 20000, opti
   return combinedDiff.length > maxChars ? combinedDiff.slice(0, maxChars) : combinedDiff;
 }
 
+/**
+ * Check if a file should be ignored when generating AI diffs (to save tokens)
+ */
+function shouldIgnoreFileForAi(filePath) {
+  if (!filePath || typeof filePath !== 'string') return true;
+  const normalized = filePath.replace(/\\/g, '/').toLowerCase();
+  const filename = normalized.split('/').pop();
+
+  // 1. Lock files
+  const lockFiles = [
+    'package-lock.json',
+    'yarn.lock',
+    'pnpm-lock.yaml',
+    'bun.lockb',
+    'cargo.lock',
+    'composer.lock',
+    'gemfile.lock',
+    'poetry.lock'
+  ];
+  if (lockFiles.includes(filename)) return true;
+
+  // 2. Build & dist directories
+  const buildDirs = [
+    'dist/',
+    'build/',
+    'out/',
+    'node_modules/',
+    '.next/',
+    '.nuxt/',
+    'target/',
+    'bin/',
+    'obj/',
+    '.vuepress/dist/',
+    'public/build/'
+  ];
+  if (buildDirs.some(dir => normalized.includes(dir))) return true;
+
+  // 3. Ext / Pattern ignores (logs, maps, minified files, binary & media assets)
+  const ignoredExts = [
+    '.log', '.map', '.min.js', '.min.css',
+    '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.webp', '.avif',
+    '.pdf', '.zip', '.tar', '.gz', '.rar', '.7z',
+    '.mp3', '.mp4', '.avi', '.mov', '.webm',
+    '.woff', '.woff2', '.ttf', '.eot', '.otf',
+    '.exe', '.dll', '.so', '.dylib', '.pyc', '.class'
+  ];
+  if (ignoredExts.some(ext => filename.endsWith(ext))) return true;
+
+  return false;
+}
+
+/**
+ * Generates a token-optimized condensed git diff summary for AI commit message generation.
+ * Structure:
+ * 1. [文件变更清单概览] (git status summary)
+ * 2. [核心代码变更] (Filtered diff with only +/- change lines, limited per file and total)
+ */
+async function getCondensedDiffForAi(cwd, token = '', maxTotalChars = 4000) {
+  const diffCommandOptions = { logOutput: false };
+
+  // 1. Get status list
+  const statusRes = await runCommand(cwd, ['status', '--porcelain=v1', '-z'], token, { trimOutput: false, logOutput: false });
+  const statusItems = parseGitStatusPorcelainZ(statusRes.stdout);
+  
+  if (statusItems.length === 0) {
+    return { success: false, empty: true, error: '工作区完全干净，没有任何改动需要提交。' };
+  }
+
+  // Filter out ignored files for detailed diff, but note them in summary
+  const validFiles = [];
+  const ignoredFiles = [];
+
+  for (const item of statusItems) {
+    const filePath = item.path || item.oldPath;
+    if (filePath) {
+      if (shouldIgnoreFileForAi(filePath)) {
+        ignoredFiles.push(filePath);
+      } else {
+        validFiles.push(item);
+      }
+    }
+  }
+
+  // Build Summary Header
+  const summaryLines = ['【文件变更清单概览】'];
+  for (const item of statusItems) {
+    const isIgnored = shouldIgnoreFileForAi(item.path);
+    const tag = isIgnored ? ' (依赖/大文件/构建产物，已自动忽略增删细节)' : '';
+    const displayStatus = (item.status || '  ').trim() || 'modified';
+    summaryLines.push(`- [${displayStatus}] ${item.path}${tag}`);
+  }
+
+  // Fetch diff for tracked files
+  const hasHeadRes = await runCommand(cwd, ['rev-parse', '--verify', 'HEAD'], token, diffCommandOptions);
+  const diffBase = hasHeadRes.success ? 'HEAD' : '4b825dc642cb6eb9a0ff3e07f4618d9157b46363';
+  
+  const trackedDiffRes = await runCommand(cwd, ['diff', diffBase, '--no-ext-diff', '-U1'], token, diffCommandOptions);
+  const rawDiff = trackedDiffRes.stdout || '';
+
+  // Also process untracked non-ignored files
+  const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
+  const untrackedDiffParts = [];
+  for (const item of validFiles) {
+    if (item.status === '??') {
+      const fileDiffRes = await runCommand(cwd, ['diff', '--no-index', '-U1', '--', nullDevice, item.path], token, diffCommandOptions);
+      if (fileDiffRes.stdout) {
+        untrackedDiffParts.push(fileDiffRes.stdout);
+      }
+    }
+  }
+
+  const allRawDiffs = [rawDiff, ...untrackedDiffParts].filter(Boolean).join('\n');
+
+  // Parse diff into condensed per-file blocks
+  const condensedDiffBlocks = [];
+  let currentFile = '';
+  let currentFileLines = [];
+  const MAX_FILE_CHARS = 800; // max chars per single file diff
+
+  const flushFileBlock = () => {
+    if (currentFile && currentFileLines.length > 0) {
+      const blockText = `--- File: ${currentFile} ---\n` + currentFileLines.join('\n');
+      condensedDiffBlocks.push(blockText.length > MAX_FILE_CHARS ? blockText.slice(0, MAX_FILE_CHARS) + '\n... (较长变更已截断)' : blockText);
+    }
+  };
+
+  const diffLines = allRawDiffs.split('\n');
+  for (const line of diffLines) {
+    if (line.startsWith('diff --git')) {
+      flushFileBlock();
+      currentFile = '';
+      currentFileLines = [];
+      const match = line.match(/b\/(.+)$/);
+      if (match) {
+        currentFile = match[1];
+      }
+    } else if (line.startsWith('--- a/') || line.startsWith('+++ b/')) {
+      if (!currentFile) {
+        const match = line.match(/\/[b|a]\/(.+)$/);
+        if (match) currentFile = match[1];
+      }
+    } else if (line.startsWith('+') || line.startsWith('-')) {
+      // Ignore header indicators like +++ or ---
+      if (line.startsWith('+++') || line.startsWith('---')) continue;
+      
+      // If the current file should be ignored, skip lines
+      if (currentFile && shouldIgnoreFileForAi(currentFile)) continue;
+      
+      // Keep modified line
+      currentFileLines.push(line);
+    }
+  }
+  flushFileBlock();
+
+  // Combine summary + condensed diffs
+  let outputText = summaryLines.join('\n');
+  if (condensedDiffBlocks.length > 0) {
+    outputText += '\n\n【核心代码变更】\n' + condensedDiffBlocks.join('\n\n');
+  } else if (ignoredFiles.length > 0) {
+    outputText += '\n\n注意：变动文件均为依赖锁或构建文件，变动细节已被精简。';
+  }
+
+  // Overall truncation limit
+  if (outputText.length > maxTotalChars) {
+    outputText = outputText.slice(0, maxTotalChars) + '\n... (超出字符限制已智能截断)';
+  }
+
+  return { success: true, empty: false, diffText: outputText };
+}
+
 // Helper to run shell commands in cwd safely
 function runCommand(cwd, args, token = '', options = {}) {
   return new Promise((resolve) => {
@@ -1607,17 +1777,13 @@ app.post('/api/ai/generate-commit', async (req, res) => {
   const aiKey = config.aiApiKey || '';
   const aiModel = config.aiModelName || 'deepseek-chat';
 
-  const diffText = await getDiffIncludingUntracked(safeDir, token);
+  const condensedResult = await getCondensedDiffForAi(safeDir, token, 4000);
 
-  if (!diffText.trim()) {
-    // If no tracked modifications, check for untracked/unstaged changes
-    const statusRes = await runCommand(safeDir, ['status', '--porcelain=v1', '-z'], token, { trimOutput: false });
-    if (parseGitStatusPorcelainZ(statusRes.stdout).length === 0) {
-      return res.json({ success: false, error: '工作区完全干净，没有任何改动需要提交。' });
-    } else {
-      return res.json({ success: false, error: '检测到改动，但未能生成有效 diff。请手动输入描述。' });
-    }
+  if (!condensedResult.success) {
+    return res.json({ success: false, error: condensedResult.error || '未能提取有效改动信息。' });
   }
+
+  const { diffText } = condensedResult;
 
   // Construct chat body
   const requestBody = {
@@ -1625,11 +1791,11 @@ app.post('/api/ai/generate-commit', async (req, res) => {
     messages: [
       {
         role: 'system',
-        content: '你是一个专业的 Git 助手。请根据提供的 Git diff，用中文写一行简明扼要的提交说明。不要使用 feat、fix、chore 等英文前缀，不要使用英文标题。请仅返回最终的中文提交说明文本，不要包含 markdown、额外解释或引号。'
+        content: '你是一个专业的 Git 助手。请根据提供的 Git 改动清单及核心代码 Diff，用中文写一行简明扼要的提交说明。不要使用 feat、fix、chore 等英文前缀，不要使用英文标题。请仅返回最终的中文提交说明文本，不要包含 markdown、额外解释或引号。'
       },
       {
         role: 'user',
-        content: diffText.substring(0, 20000) // limit to avoid token limits
+        content: diffText
       }
     ],
     temperature: 0.2
