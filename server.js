@@ -19,9 +19,14 @@ const PROTECTED_PROJECT_PATH_ERROR = '已阻止操作工具自身目录。请链
 
 // Memory logs of executed git commands
 const MAX_GIT_COMMAND_LOGS = 500;
+const MAX_GIT_LOG_ENTRY_CHARS = 32 * 1024;
+const GITHUB_API_TIMEOUT_MS = 15000;
+const REMOTE_HISTORY_FETCH_TTL_MS = 30000;
 let gitCommandLogs = [];
 let gitCommandLogSeq = 0;
 let gitCommandRunSeq = 0;
+const remoteHistoryFetches = new Map();
+const activeRepositoryMutations = new Map();
 
 function readJsonFile(filePath) {
   if (fs.existsSync(filePath)) {
@@ -109,10 +114,15 @@ function buildGitEnv(token = '') {
 }
 
 function appendGitCommandLog(type, text, timestamp) {
+  const rawText = String(text || '');
+  const boundedText = rawText.length > MAX_GIT_LOG_ENTRY_CHARS
+    ? `${rawText.slice(0, 20 * 1024)}\n... [日志过长，已省略 ${rawText.length - MAX_GIT_LOG_ENTRY_CHARS} 个字符] ...\n${rawText.slice(-12 * 1024)}`
+    : rawText;
+
   gitCommandLogs.push({
     id: ++gitCommandLogSeq,
     type,
-    text,
+    text: boundedText,
     timestamp
   });
 
@@ -722,8 +732,8 @@ function runCommand(cwd, args, token = '', options = {}) {
     execFile('git', args, {
       cwd,
       env: buildGitEnv(token),
-      maxBuffer: options.maxBuffer || 1024 * 1024 * 10,
-      timeout: 60000,
+      maxBuffer: options.maxBuffer ?? 1024 * 1024 * 10,
+      timeout: options.timeoutMs ?? 60000,
       encoding: 'utf8'
     }, (error, stdout, stderr) => {
       const trimOutput = options.trimOutput !== false;
@@ -761,6 +771,40 @@ function runCommand(cwd, args, token = '', options = {}) {
   });
 }
 
+function repositoryOperationKey(dirPath) {
+  const resolved = path.resolve(dirPath).replace(/[\\/]+$/, '');
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+async function fetchRemoteHistory(cwd, branch, token = '') {
+  const pathKey = process.platform === 'win32' ? cwd.toLowerCase() : cwd;
+  const cacheKey = `${pathKey}\0${branch}`;
+  const cached = remoteHistoryFetches.get(cacheKey);
+
+  if (cached && cached.promise) {
+    return cached.promise;
+  }
+  if (cached && Date.now() - cached.updatedAt < REMOTE_HISTORY_FETCH_TTL_MS) {
+    return { success: true, cached: true };
+  }
+
+  const promise = runCommand(
+    cwd,
+    ['fetch', '--quiet', '--no-tags', 'origin', branch],
+    token,
+    { logOutput: false, timeoutMs: 30000 }
+  );
+  remoteHistoryFetches.set(cacheKey, { updatedAt: cached?.updatedAt || 0, promise });
+
+  const result = await promise;
+  if (result.success) {
+    remoteHistoryFetches.set(cacheKey, { updatedAt: Date.now(), promise: null });
+  } else {
+    remoteHistoryFetches.delete(cacheKey);
+  }
+  return result;
+}
+
 // Native Node fetch Helper for GitHub API Calls (Supported natively in Node.js v24)
 async function callGithubApi(method, apiPath, body, token) {
   try {
@@ -772,7 +816,8 @@ async function callGithubApi(method, apiPath, body, token) {
         'Accept': 'application/vnd.github.v3+json',
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json'
-      }
+      },
+      signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS)
     };
 
     if (body) {
@@ -794,7 +839,10 @@ async function callGithubApi(method, apiPath, body, token) {
       return { success: false, statusCode: res.status, error: jsonRes.message || 'GitHub API 发生错误' };
     }
   } catch (err) {
-    return { success: false, error: err.message };
+    const error = err && (err.name === 'TimeoutError' || err.name === 'AbortError')
+      ? `GitHub API 请求超过 ${GITHUB_API_TIMEOUT_MS / 1000} 秒，已取消`
+      : err.message;
+    return { success: false, error };
   }
 }
 
@@ -962,6 +1010,16 @@ app.post('/api/repo/status', async (req, res) => {
     return res.json(protectedProjectStatus(safeDir));
   }
 
+  const activeMutation = activeRepositoryMutations.get(repositoryOperationKey(safeDir));
+  if (activeMutation) {
+    return res.status(409).json({
+      success: false,
+      busy: true,
+      operation: activeMutation.operation,
+      error: '仓库正在提交或推送，已暂缓状态扫描，避免多个 Git 进程互相争用。'
+    });
+  }
+
   const config = loadConfig();
   const token = config.githubToken || '';
   const isRepo = await isGitRepository(safeDir, token);
@@ -975,22 +1033,37 @@ app.post('/api/repo/status', async (req, res) => {
     });
   }
 
-  // Get current remote URL
-  const remoteResult = await runCommand(safeDir, ['remote', 'get-url', 'origin'], token);
+  // These are independent reads. Running them together makes refresh noticeably
+  // faster on large repositories and avoids writing huge status output to UI logs.
+  const [remoteResult, branchResult, statusResult] = await Promise.all([
+    runCommand(safeDir, ['remote', 'get-url', 'origin'], token, { logOutput: false }),
+    runCommand(safeDir, ['branch', '--show-current'], token, { logOutput: false }),
+    runCommand(safeDir, ['status', '--porcelain=v1', '-z'], token, {
+      trimOutput: false,
+      logOutput: false,
+      timeoutMs: 30000
+    })
+  ]);
+
   let remoteUrl = '';
   if (remoteResult.success) {
     remoteUrl = remoteResult.stdout;
   }
 
-  // Get current branch
-  const branchResult = await runCommand(safeDir, ['branch', '--show-current'], token);
   let currentBranch = '';
   if (branchResult.success) {
     currentBranch = branchResult.stdout;
   }
 
-  // Check status of changes
-  const statusResult = await runCommand(safeDir, ['status', '--porcelain=v1', '-z'], token, { trimOutput: false });
+  if (!statusResult.success) {
+    return res.status(503).json({
+      success: false,
+      error: statusResult.error && statusResult.error.includes('timed out')
+        ? '工作区扫描超过 30 秒，已停止。本地目录可能包含过多未忽略文件，请完善 .gitignore 后重试。'
+        : `读取工作区改动失败: ${statusResult.error}`
+    });
+  }
+
   const changesList = statusResult.success ? parseGitStatusPorcelainZ(statusResult.stdout) : [];
   const hasChanges = changesList.length > 0;
 
@@ -1110,7 +1183,7 @@ app.post('/api/repo/history', async (req, res) => {
     return res.status(400).json({ success: false, error: branchValidation.error });
   }
 
-  const fetchRes = await runCommand(safeDir, ['fetch', 'origin', branch], token);
+  const fetchRes = await fetchRemoteHistory(safeDir, branch, token);
   if (!fetchRes.success) {
     if (fetchRes.error.includes("couldn't find remote ref")) {
       return res.json({ success: true, commits: [], remoteBranchExists: false });
@@ -1161,7 +1234,18 @@ app.post('/api/repo/commit', async (req, res) => {
     return res.status(repoCheck.statusCode).json({ success: false, error: repoCheck.error });
   }
   const { safeDir } = repoCheck;
+  const operationKey = repositoryOperationKey(safeDir);
+  if (activeRepositoryMutations.has(operationKey)) {
+    return res.status(409).json({
+      success: false,
+      busy: true,
+      error: '该仓库已有提交推送任务正在执行，请勿重复提交。'
+    });
+  }
+  const operationMarker = { operation: 'commit', startedAt: Date.now() };
+  activeRepositoryMutations.set(operationKey, operationMarker);
 
+  try {
   if (!branch) {
     return res.status(400).json({ success: false, error: 'Branch is required.' });
   }
@@ -1207,7 +1291,12 @@ app.post('/api/repo/commit', async (req, res) => {
   }
 
   const pushStartedAt = Date.now();
-  const pushRes = await runCommand(safeDir, ['push', '--force-with-lease', 'origin', branch], token);
+  const pushRes = await runCommand(
+    safeDir,
+    ['push', '--force-with-lease', 'origin', branch],
+    token,
+    { timeoutMs: 5 * 60 * 1000 }
+  );
   const pushDurationMs = Date.now() - pushStartedAt;
   if (!pushRes.success) {
     return res.json({ success: false, error: 'Failed to push: ' + pushRes.error });
@@ -1221,6 +1310,11 @@ app.post('/api/repo/commit', async (req, res) => {
     pushDurationMs,
     totalDurationMs: Date.now() - operationStartedAt
   });
+  } finally {
+    if (activeRepositoryMutations.get(operationKey) === operationMarker) {
+      activeRepositoryMutations.delete(operationKey);
+    }
+  }
 });
 
 // Switch branch

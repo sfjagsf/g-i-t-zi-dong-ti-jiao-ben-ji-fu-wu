@@ -26,7 +26,10 @@ let refreshChangesRequestSeq = 0;
 const MAX_CONSOLE_LINES = 200;
 const LOG_POLL_VISIBLE_MS = 2000;
 const LOG_POLL_HIDDEN_MS = 8000;
-const MAX_RENDERED_DIFF_CHARS = 600000;
+const DEFAULT_API_TIMEOUT_MS = 45000;
+const COMMIT_API_TIMEOUT_MS = 330000;
+const MAX_RENDERED_DIFF_CHARS = 200000;
+const MAX_RENDERED_CHANGE_ITEMS = 500;
 const PROTECTED_PROJECT_PATH_MESSAGE = '已阻止操作 GFlow 工具自身目录。请链接真实项目目录，不要把工具安装目录作为目标仓库。';
 
 // Repository dropdown and branch list caches
@@ -197,6 +200,12 @@ function appendIcon(parent, name, className = '') {
   return icon;
 }
 
+function refreshIcons() {
+  if (window.lucide && typeof window.lucide.createIcons === 'function') {
+    window.lucide.createIcons();
+  }
+}
+
 function setTextState(container, text, extraClass = '') {
   container.replaceChildren();
   const state = document.createElement('div');
@@ -234,28 +243,40 @@ function createGraphTrack(symbols) {
 }
 
 // API Call Wrappers
-async function apiPost(url, data = {}) {
+async function requestJson(url, options = {}, timeoutMs = DEFAULT_API_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+
   try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    return await res.json();
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    const data = await res.json();
+    if (!res.ok && data && data.success !== false) {
+      return { success: false, error: `服务请求失败 (${res.status})` };
+    }
+    return data;
   } catch (err) {
     console.error(`API Error (${url}):`, err);
-    return { success: false, error: '网络连接失败，请检查后端服务是否开启。' };
+    return {
+      success: false,
+      error: err && err.name === 'AbortError'
+        ? `请求超过 ${Math.round(timeoutMs / 1000)} 秒，已自动取消，请稍后重试。`
+        : '网络连接失败，请检查后端服务是否开启。'
+    };
+  } finally {
+    window.clearTimeout(timeoutId);
   }
 }
 
-async function apiGet(url) {
-  try {
-    const res = await fetch(url);
-    return await res.json();
-  } catch (err) {
-    console.error(`API Error (${url}):`, err);
-    return { success: false, error: '网络连接失败，请检查后端服务是否开启。' };
-  }
+async function apiPost(url, data = {}, options = {}) {
+  return requestJson(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data)
+  }, options.timeoutMs);
+}
+
+async function apiGet(url, options = {}) {
+  return requestJson(url, {}, options.timeoutMs);
 }
 
 // Load configurations from server
@@ -266,7 +287,8 @@ async function loadServerConfig() {
     if (config.hasGithubToken) {
       tokenInput.value = '';
       updateAuthUI(true, config.username || 'GitHub 账户已关联', config.avatarUrl);
-      await fetchGithubRepos(); // Fetch repos immediately
+      // Remote loading can be slow or offline. Do not let it block local UI restore.
+      fetchGithubRepos();
     } else {
       updateAuthUI(false);
     }
@@ -301,6 +323,9 @@ function populateRecentPathsDropdown(paths) {
 // Append new physical path to recent history
 async function addPathToRecent(newPath) {
   let paths = currentConfig.recentPaths || [];
+  if (paths[0] === newPath && currentConfig.lastProjectPath === newPath) {
+    return;
+  }
   
   // Filter out duplicates
   paths = paths.filter(p => p !== newPath);
@@ -312,9 +337,10 @@ async function addPathToRecent(newPath) {
   }
 
   currentConfig.recentPaths = paths;
+  currentConfig.lastProjectPath = newPath;
   
   // Persist to backend config
-  await apiPost('/api/config', { recentPaths: paths });
+  await apiPost('/api/config', { recentPaths: paths, lastProjectPath: newPath });
   
   // Refresh dropdown list
   populateRecentPathsDropdown(paths);
@@ -352,9 +378,12 @@ function updateAuthUI(isLoggedIn, username = '', avatarUrl = '') {
 
 // Fetch GitHub Username and Avatar using the token
 async function fetchGithubProfile(token) {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 15000);
   try {
     const res = await fetch('https://api.github.com/user', {
-      headers: { 'Authorization': `token ${token}` }
+      headers: { 'Authorization': `token ${token}` },
+      signal: controller.signal
     });
     if (res.ok) {
       const data = await res.json();
@@ -365,6 +394,8 @@ async function fetchGithubProfile(token) {
     }
   } catch (e) {
     console.error('Failed to fetch github profile:', e);
+  } finally {
+    window.clearTimeout(timeoutId);
   }
   return null;
 }
@@ -614,7 +645,7 @@ function populateBranchesUI(repo, branches) {
   });
 
   branchesListContainer.appendChild(fragment);
-  lucide.createIcons();
+  refreshIcons();
 }
 
 // Match remote URL
@@ -898,6 +929,13 @@ async function loadProjectPath(dirPath, isRetry = false) {
     if (!bindingStarted && selectedBranch) {
       loadCommitHistory();
     }
+  } else if (statusRes.busy) {
+    addSystemLog(statusRes.error || '仓库正在执行 Git 操作，稍后自动重试。');
+    window.setTimeout(() => {
+      if (requestSeq === repoStatusRequestSeq) {
+        loadProjectPath(absolutePath, true);
+      }
+    }, 3000);
   } else {
     addSystemLog(`加载仓库状态出错: ${statusRes.error}`);
   }
@@ -1000,7 +1038,7 @@ function renderFileChanges(files) {
 
   const fragment = document.createDocumentFragment();
 
-  files.forEach(changeEntry => {
+  files.slice(0, MAX_RENDERED_CHANGE_ITEMS).forEach(changeEntry => {
     const change = normalizeChangeEntry(changeEntry);
     const filePath = change.path;
     const displayPath = change.oldPath ? `${change.oldPath} -> ${change.path}` : change.path;
@@ -1035,6 +1073,13 @@ function renderFileChanges(files) {
 
     fragment.appendChild(item);
   });
+
+  if (files.length > MAX_RENDERED_CHANGE_ITEMS) {
+    const notice = document.createElement('div');
+    notice.className = 'empty-state-text text-warning';
+    notice.innerText = `改动较多，仅展示前 ${MAX_RENDERED_CHANGE_ITEMS} 项；提交仍会包含全部改动。`;
+    fragment.appendChild(notice);
+  }
 
   fileChangesListContainer.appendChild(fragment);
 }
@@ -1072,7 +1117,16 @@ function renderDiffHtml() {
     truncated = true;
   }
 
-  const html = Diff2Html.html(diffToRender, {
+  if (!window.Diff2Html || typeof window.Diff2Html.html !== 'function') {
+    diffBody.replaceChildren();
+    const fallback = document.createElement('pre');
+    fallback.className = 'diff-text-fallback';
+    fallback.textContent = diffToRender;
+    diffBody.appendChild(fallback);
+    return;
+  }
+
+  const html = window.Diff2Html.html(diffToRender, {
     drawFileList: false,
     matching: 'lines',
     outputFormat: currentDiffFormat
@@ -1236,7 +1290,7 @@ async function loadCommitHistory() {
     });
 
     historyContent.appendChild(timeline);
-    lucide.createIcons();
+    refreshIcons();
 
     // Trigger Actions workflow runs fetch in background
     loadActionsRunsForRepo();
@@ -1317,7 +1371,7 @@ function renderHistoryWithActionsStatus() {
     }
   });
 
-  lucide.createIcons();
+  refreshIcons();
 }
 
 // Expand action menu on a specific history item
@@ -1369,7 +1423,7 @@ function renderHistoryWithSelectedMenu() {
         bodyEl.appendChild(actionMenu);
       }
       
-      lucide.createIcons();
+      refreshIcons();
     }
   });
 }
@@ -1556,7 +1610,7 @@ btnCommitPush.addEventListener('click', async () => {
       branch: selectedBranch,
       description: desc,
       expectedRepoFullName: getExpectedRepoFullName()
-    });
+    }, { timeoutMs: COMMIT_API_TIMEOUT_MS });
 
     if (res.success) {
       const pushSeconds = typeof res.pushDurationMs === 'number'
@@ -1573,11 +1627,9 @@ btnCommitPush.addEventListener('click', async () => {
       btnCommitPush.innerText = '推送完成，正在刷新...';
       commitDescInput.value = '';
       selectedCommitHash = '';
-      await Promise.all([
-        refreshLocalChanges({ force: true }),
-        loadCommitHistory()
-      ]);
-      addSystemLog(`界面刷新完成。`);
+      await refreshLocalChanges({ force: true });
+      addSystemLog('本地状态刷新完成，提交历史正在后台更新。');
+      loadCommitHistory();
     } else {
       addSystemLog(`提交失败: ${res.error}`);
     }
@@ -1585,7 +1637,7 @@ btnCommitPush.addEventListener('click', async () => {
     isCommitInProgress = false;
     btnCommitPush.disabled = false;
     btnCommitPush.innerHTML = COMMIT_BUTTON_HTML;
-    lucide.createIcons();
+    refreshIcons();
   }
 });
 
@@ -1803,9 +1855,11 @@ document.addEventListener('visibilitychange', () => {
   scheduleLogPolling(document.hidden ? LOG_POLL_HIDDEN_MS : 0);
 });
 
+window.addEventListener('load', refreshIcons, { once: true });
+
 // Initialization
 document.addEventListener('DOMContentLoaded', () => {
-  lucide.createIcons();
+  refreshIcons();
   loadServerConfig();
   
   scheduleLogPolling(0);

@@ -44,6 +44,17 @@ body {
   position: relative;
 }
 
+.diff-text-fallback {
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-main);
+  background: rgba(0, 0, 0, 0.24);
+  font: 12px/1.55 var(--font-mono);
+}
+
 /* Ambient Background Glow */
 .glow-bg {
   position: absolute;
