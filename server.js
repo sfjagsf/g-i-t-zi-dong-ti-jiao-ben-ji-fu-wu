@@ -24,6 +24,7 @@ const GITHUB_API_TIMEOUT_MS = 15000;
 const REMOTE_HISTORY_FETCH_TTL_MS = 30000;
 const AI_REQUEST_TIMEOUT_MS = 60000;
 const AI_REQUEST_MAX_ATTEMPTS = 2;
+const AI_EMPTY_RESPONSE_MAX_ATTEMPTS = 2;
 const MAX_AI_STATUS_ITEMS = 200;
 const MAX_AI_TRACKED_DIFF_FILES = 40;
 const MAX_AI_UNTRACKED_DIFF_FILES = 10;
@@ -1036,25 +1037,31 @@ function contentToText(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
     return content
-      .map(part => typeof part === 'string' ? part : (part && (part.text || part.content)) || '')
+      .map(contentToText)
       .filter(Boolean)
       .join('');
   }
   if (content && typeof content === 'object') {
-    return content.text || content.content || '';
+    return contentToText(content.text || content.content || content.output_text || content.value || '');
   }
   return '';
 }
 
 function extractAiMessage(data) {
   if (!data || typeof data !== 'object') return '';
-  const choice = Array.isArray(data.choices) ? data.choices[0] : null;
+  const choices = Array.isArray(data.choices) ? data.choices : [];
   const candidates = [
-    choice && choice.message && choice.message.content,
-    choice && choice.text,
+    ...choices.flatMap(choice => [
+      choice && choice.message && choice.message.content,
+      choice && choice.message && choice.message.text,
+      choice && choice.delta && choice.delta.content,
+      choice && choice.text
+    ]),
     data.output_text,
     data.response,
-    data.message && data.message.content
+    data.message && data.message.content,
+    data.message,
+    data.output
   ];
 
   for (const candidate of candidates) {
@@ -1062,6 +1069,22 @@ function extractAiMessage(data) {
     if (text) return text;
   }
   return '';
+}
+
+function getAiEmptyResponseReason(rawText) {
+  try {
+    const data = JSON.parse(rawText);
+    const error = data && data.error;
+    if (typeof error === 'string' && error.trim()) return error.trim();
+    if (error && typeof error.message === 'string' && error.message.trim()) return error.message.trim();
+    if (typeof data.detail === 'string' && data.detail.trim()) return data.detail.trim();
+
+    const choice = Array.isArray(data.choices) ? data.choices[0] : null;
+    if (choice && choice.finish_reason) return `模型结束原因: ${choice.finish_reason}`;
+  } catch (err) {
+    return '返回内容不是可识别的 JSON/SSE 格式';
+  }
+  return '服务成功响应，但未包含可用的文本字段';
 }
 
 function parseAiResponse(rawText) {
@@ -2066,34 +2089,51 @@ app.post('/api/ai/generate-commit', async (req, res) => {
       headers['Authorization'] = `Bearer ${aiKey}`;
     }
 
-    const aiResult = await requestAiCompletion(aiUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(requestBody)
-    });
-
-    if (!aiResult.success) {
-      const safeError = maskSensitiveLog(maskSensitiveLog(aiResult.rawText, aiKey), token).slice(0, 2000);
-      return res.json({
-        success: false,
-        error: `AI 服务返回错误 (${aiResult.status})${safeError ? `: ${safeError}` : ''}`
-      });
-    }
-
-    const rawText = aiResult.rawText;
     let aiMessage = '';
-    try {
-      aiMessage = parseAiResponse(rawText).message;
-    } catch (e) {
-      const safeResponse = maskSensitiveLog(maskSensitiveLog(rawText, aiKey), token).slice(0, 1000);
-      return res.json({
-        success: false,
-        error: `解析 AI 响应失败: ${e.message}${safeResponse ? `。响应摘要: ${safeResponse}` : ''}`
+    let lastRawText = '';
+    let lastParseError = null;
+
+    // 部分兼容服务会偶发返回 HTTP 200 但 choices 内容为空。此时重试一次，
+    // 避免把临时服务端空响应误判成用户配置错误。
+    for (let attempt = 1; attempt <= AI_EMPTY_RESPONSE_MAX_ATTEMPTS; attempt += 1) {
+      const aiResult = await requestAiCompletion(aiUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(requestBody)
       });
+
+      if (!aiResult.success) {
+        const safeError = maskSensitiveLog(maskSensitiveLog(aiResult.rawText, aiKey), token).slice(0, 2000);
+        return res.json({
+          success: false,
+          error: `AI 服务返回错误 (${aiResult.status})${safeError ? `: ${safeError}` : ''}`
+        });
+      }
+
+      lastRawText = aiResult.rawText;
+      try {
+        aiMessage = parseAiResponse(lastRawText).message;
+        if (aiMessage) break;
+      } catch (err) {
+        lastParseError = err;
+      }
+
+      if (attempt < AI_EMPTY_RESPONSE_MAX_ATTEMPTS) await delay(800);
     }
 
     if (!aiMessage) {
-      return res.json({ success: false, error: 'AI 服务未返回有效的描述内容，请检查接口配置。' });
+      if (lastParseError) {
+        const safeResponse = maskSensitiveLog(maskSensitiveLog(lastRawText, aiKey), token).slice(0, 1000);
+        return res.json({
+          success: false,
+          error: `解析 AI 响应失败: ${lastParseError.message}${safeResponse ? `。响应摘要: ${safeResponse}` : ''}`
+        });
+      }
+      const reason = getAiEmptyResponseReason(lastRawText);
+      return res.json({
+        success: false,
+        error: `AI 服务连续 ${AI_EMPTY_RESPONSE_MAX_ATTEMPTS} 次返回空内容（${reason}）。这通常是模型服务临时负载或上游响应异常，请稍后重试。`
+      });
     }
 
     // Clean up typical AI wrappers if present
