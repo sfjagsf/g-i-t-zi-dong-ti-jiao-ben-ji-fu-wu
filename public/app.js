@@ -18,6 +18,7 @@ let logPollTimer = null;
 let isLogPolling = false;
 let isBindingInProgress = false;
 let isCommitInProgress = false;
+let isAiCommitGenerating = false;
 let isRefreshingChanges = false;
 let repoStatusRequestSeq = 0;
 let historyRequestSeq = 0;
@@ -28,6 +29,7 @@ const LOG_POLL_VISIBLE_MS = 2000;
 const LOG_POLL_HIDDEN_MS = 8000;
 const DEFAULT_API_TIMEOUT_MS = 45000;
 const COMMIT_API_TIMEOUT_MS = 330000;
+const AI_GENERATION_API_TIMEOUT_MS = 130000;
 const MAX_RENDERED_DIFF_CHARS = 200000;
 const MAX_RENDERED_CHANGE_ITEMS = 500;
 const PROTECTED_PROJECT_PATH_MESSAGE = '已阻止操作 GFlow 工具自身目录。请链接真实项目目录，不要把工具安装目录作为目标仓库。';
@@ -1166,6 +1168,11 @@ async function showFileDiff(filePath, oldPath = '') {
 
 // AI Commit Generation Button click listener
 btnAiCommit.addEventListener('click', async () => {
+  if (isAiCommitGenerating) {
+    addSystemLog('AI 提交描述正在生成，请稍候。');
+    return;
+  }
+
   const dirPath = pathInput.value.trim();
   if (!dirPath) {
     addSystemLog('请先链接仓库目录！');
@@ -1177,22 +1184,35 @@ btnAiCommit.addEventListener('click', async () => {
   }
 
   addSystemLog('正在通过 AI 生成提交描述...');
+  isAiCommitGenerating = true;
   btnAiCommit.disabled = true;
   aiBtnText.innerText = '正在智能生成...';
   aiBtnSpinner.classList.remove('hidden');
 
-  const res = await apiPost('/api/ai/generate-commit', { dirPath });
+  try {
+    const result = await apiPost(
+      '/api/ai/generate-commit',
+      { dirPath },
+      { timeoutMs: AI_GENERATION_API_TIMEOUT_MS }
+    );
 
-  btnAiCommit.disabled = false;
-  aiBtnText.innerText = '✨ AI 智能生成';
-  aiBtnSpinner.classList.add('hidden');
-
-  if (res.success) {
-    commitDescInput.value = res.commitMessage;
-    addSystemLog('AI 描述生成并填入完成！');
-  } else {
-    addSystemLog(`AI 描述生成失败: ${res.error}`);
-    alert(`生成失败: ${res.error}`);
+    if (result.success) {
+      if (pathInput.value.trim() !== dirPath) {
+        addSystemLog('AI 描述已生成，但当前项目已切换，因此未自动填入。');
+        return;
+      }
+      commitDescInput.value = result.commitMessage;
+      addSystemLog('AI 描述生成并填入完成！');
+    } else {
+      const error = result.error || '未知错误';
+      addSystemLog(`AI 描述生成失败: ${error}`);
+      alert(`生成失败: ${error}`);
+    }
+  } finally {
+    isAiCommitGenerating = false;
+    btnAiCommit.disabled = false;
+    aiBtnText.innerText = '✨ AI 智能生成';
+    aiBtnSpinner.classList.add('hidden');
   }
 });
 

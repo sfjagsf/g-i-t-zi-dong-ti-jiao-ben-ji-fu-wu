@@ -22,6 +22,11 @@ const MAX_GIT_COMMAND_LOGS = 500;
 const MAX_GIT_LOG_ENTRY_CHARS = 32 * 1024;
 const GITHUB_API_TIMEOUT_MS = 15000;
 const REMOTE_HISTORY_FETCH_TTL_MS = 30000;
+const AI_REQUEST_TIMEOUT_MS = 60000;
+const AI_REQUEST_MAX_ATTEMPTS = 2;
+const MAX_AI_STATUS_ITEMS = 200;
+const MAX_AI_TRACKED_DIFF_FILES = 40;
+const MAX_AI_UNTRACKED_DIFF_FILES = 10;
 let gitCommandLogs = [];
 let gitCommandLogSeq = 0;
 let gitCommandRunSeq = 0;
@@ -593,10 +598,26 @@ function shouldIgnoreFileForAi(filePath) {
  * 2. [核心代码变更] (Filtered diff with only +/- change lines, limited per file and total)
  */
 async function getCondensedDiffForAi(cwd, token = '', maxTotalChars = 4000) {
-  const diffCommandOptions = { logOutput: false };
+  const diffCommandOptions = {
+    logOutput: false,
+    maxBuffer: 512 * 1024,
+    timeoutMs: 15000
+  };
 
   // 1. Get status list
-  const statusRes = await runCommand(cwd, ['status', '--porcelain=v1', '-z'], token, { trimOutput: false, logOutput: false });
+  const statusRes = await runCommand(cwd, ['status', '--porcelain=v1', '-z'], token, {
+    trimOutput: false,
+    logOutput: false,
+    timeoutMs: 20000
+  });
+  if (!statusRes.success) {
+    return {
+      success: false,
+      error: statusRes.error && statusRes.error.includes('timed out')
+        ? '扫描改动超过 20 秒，请检查是否存在大量未忽略文件。'
+        : `读取 Git 改动失败: ${statusRes.error}`
+    };
+  }
   const statusItems = parseGitStatusPorcelainZ(statusRes.stdout);
   
   if (statusItems.length === 0) {
@@ -620,28 +641,51 @@ async function getCondensedDiffForAi(cwd, token = '', maxTotalChars = 4000) {
 
   // Build Summary Header
   const summaryLines = ['【文件变更清单概览】'];
-  for (const item of statusItems) {
+  for (const item of statusItems.slice(0, MAX_AI_STATUS_ITEMS)) {
     const isIgnored = shouldIgnoreFileForAi(item.path);
     const tag = isIgnored ? ' (依赖/大文件/构建产物，已自动忽略增删细节)' : '';
     const displayStatus = (item.status || '  ').trim() || 'modified';
     summaryLines.push(`- [${displayStatus}] ${item.path}${tag}`);
+  }
+  if (statusItems.length > MAX_AI_STATUS_ITEMS) {
+    summaryLines.push(`- ... 另有 ${statusItems.length - MAX_AI_STATUS_ITEMS} 个文件未展开`);
   }
 
   // Fetch diff for tracked files
   const hasHeadRes = await runCommand(cwd, ['rev-parse', '--verify', 'HEAD'], token, diffCommandOptions);
   const diffBase = hasHeadRes.success ? 'HEAD' : '4b825dc642cb6eb9a0ff3e07f4618d9157b46363';
   
-  const trackedDiffRes = await runCommand(cwd, ['diff', diffBase, '--no-ext-diff', '-U1'], token, diffCommandOptions);
+  const trackedPaths = validFiles
+    .filter(item => item.status !== '??')
+    .flatMap(item => [item.oldPath, item.path])
+    .filter(isSafeRelativePathspec)
+    .slice(0, MAX_AI_TRACKED_DIFF_FILES);
+  const trackedDiffRes = trackedPaths.length > 0
+    ? await runCommand(
+        cwd,
+        ['diff', diffBase, '--no-ext-diff', '-U1', '--', ...trackedPaths],
+        token,
+        diffCommandOptions
+      )
+    : { stdout: '' };
   const rawDiff = trackedDiffRes.stdout || '';
 
   // Also process untracked non-ignored files
   const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
   const untrackedDiffParts = [];
+  let untrackedFileCount = 0;
+  let collectedUntrackedChars = 0;
   for (const item of validFiles) {
-    if (item.status === '??') {
+    if (item.status === '??' && isSafeRelativePathspec(item.path)) {
+      if (untrackedFileCount >= MAX_AI_UNTRACKED_DIFF_FILES || collectedUntrackedChars >= maxTotalChars * 2) {
+        break;
+      }
+      untrackedFileCount += 1;
       const fileDiffRes = await runCommand(cwd, ['diff', '--no-index', '-U1', '--', nullDevice, item.path], token, diffCommandOptions);
       if (fileDiffRes.stdout) {
-        untrackedDiffParts.push(fileDiffRes.stdout);
+        const boundedDiff = fileDiffRes.stdout.slice(0, maxTotalChars);
+        untrackedDiffParts.push(boundedDiff);
+        collectedUntrackedChars += boundedDiff.length;
       }
     }
   }
@@ -936,6 +980,125 @@ function normalizeChatCompletionsUrl(rawUrl) {
     return `${trimmed}/chat/completions`;
   }
   return `${trimmed}/v1/chat/completions`;
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isRetryableAiStatus(status) {
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+async function requestAiCompletion(aiUrl, options) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= AI_REQUEST_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(aiUrl, {
+        ...options,
+        signal: AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS)
+      });
+      const rawText = await response.text();
+
+      if (response.ok) {
+        return { success: true, rawText, attempt };
+      }
+
+      if (attempt < AI_REQUEST_MAX_ATTEMPTS && isRetryableAiStatus(response.status)) {
+        const retryAfter = Number(response.headers.get('retry-after'));
+        const retryDelayMs = Number.isFinite(retryAfter)
+          ? Math.min(Math.max(retryAfter * 1000, 300), 3000)
+          : 800;
+        await delay(retryDelayMs);
+        continue;
+      }
+
+      return { success: false, status: response.status, rawText, attempt };
+    } catch (err) {
+      lastError = err;
+      const retryable = err && (
+        err.name === 'TimeoutError' ||
+        err.name === 'AbortError' ||
+        (err.message && err.message.includes('fetch failed'))
+      );
+      if (!retryable || attempt >= AI_REQUEST_MAX_ATTEMPTS) {
+        throw err;
+      }
+      await delay(800);
+    }
+  }
+
+  throw lastError || new Error('AI 请求失败');
+}
+
+function contentToText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map(part => typeof part === 'string' ? part : (part && (part.text || part.content)) || '')
+      .filter(Boolean)
+      .join('');
+  }
+  if (content && typeof content === 'object') {
+    return content.text || content.content || '';
+  }
+  return '';
+}
+
+function extractAiMessage(data) {
+  if (!data || typeof data !== 'object') return '';
+  const choice = Array.isArray(data.choices) ? data.choices[0] : null;
+  const candidates = [
+    choice && choice.message && choice.message.content,
+    choice && choice.text,
+    data.output_text,
+    data.response,
+    data.message && data.message.content
+  ];
+
+  for (const candidate of candidates) {
+    const text = contentToText(candidate).trim();
+    if (text) return text;
+  }
+  return '';
+}
+
+function parseAiResponse(rawText) {
+  try {
+    const data = JSON.parse(rawText);
+    return { data, message: extractAiMessage(data) };
+  } catch (jsonError) {
+    const streamedParts = [];
+    for (const line of String(rawText).split(/\r?\n/)) {
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+      try {
+        const event = JSON.parse(payload);
+        const choice = Array.isArray(event.choices) ? event.choices[0] : null;
+        const part = contentToText(
+          (choice && choice.delta && choice.delta.content) ||
+          (choice && choice.message && choice.message.content) ||
+          (choice && choice.text)
+        );
+        if (part) streamedParts.push(part);
+      } catch (err) {
+        // Ignore non-JSON keepalive/event lines.
+      }
+    }
+    if (streamedParts.length > 0) {
+      return { data: null, message: streamedParts.join('').trim() };
+    }
+
+    const firstBraceIndex = rawText.indexOf('{');
+    const lastBraceIndex = rawText.lastIndexOf('}');
+    if (firstBraceIndex !== -1 && lastBraceIndex > firstBraceIndex) {
+      const data = JSON.parse(rawText.slice(firstBraceIndex, lastBraceIndex + 1));
+      return { data, message: extractAiMessage(data) };
+    }
+    throw jsonError;
+  }
 }
 
 // Get config
@@ -1892,7 +2055,9 @@ app.post('/api/ai/generate-commit', async (req, res) => {
         content: diffText
       }
     ],
-    temperature: 0.2
+    temperature: 0.2,
+    max_tokens: 120,
+    stream: false
   };
 
   try {
@@ -1901,36 +2066,31 @@ app.post('/api/ai/generate-commit', async (req, res) => {
       headers['Authorization'] = `Bearer ${aiKey}`;
     }
 
-    const response = await fetch(aiUrl, {
+    const aiResult = await requestAiCompletion(aiUrl, {
       method: 'POST',
       headers,
       body: JSON.stringify(requestBody)
     });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      return res.json({ success: false, error: `AI 服务返回错误 (${response.status}): ${maskSensitiveLog(errText, token)}` });
+    if (!aiResult.success) {
+      const safeError = maskSensitiveLog(maskSensitiveLog(aiResult.rawText, aiKey), token).slice(0, 2000);
+      return res.json({
+        success: false,
+        error: `AI 服务返回错误 (${aiResult.status})${safeError ? `: ${safeError}` : ''}`
+      });
     }
 
-    const rawText = await response.text();
-    let data;
+    const rawText = aiResult.rawText;
+    let aiMessage = '';
     try {
-      data = JSON.parse(rawText);
+      aiMessage = parseAiResponse(rawText).message;
     } catch (e) {
-      const lastBraceIndex = rawText.lastIndexOf('}');
-      if (lastBraceIndex !== -1) {
-        try {
-          data = JSON.parse(rawText.substring(0, lastBraceIndex + 1));
-        } catch (innerErr) {
-          return res.json({ success: false, error: `解析 AI 响应失败: ${e.message}。原始响应: ${maskSensitiveLog(rawText, token)}` });
-        }
-      } else {
-        return res.json({ success: false, error: `解析 AI 响应失败: ${e.message}。原始响应: ${maskSensitiveLog(rawText, token)}` });
-      }
+      const safeResponse = maskSensitiveLog(maskSensitiveLog(rawText, aiKey), token).slice(0, 1000);
+      return res.json({
+        success: false,
+        error: `解析 AI 响应失败: ${e.message}${safeResponse ? `。响应摘要: ${safeResponse}` : ''}`
+      });
     }
-    const aiMessage = data.choices && data.choices[0] && data.choices[0].message
-      ? data.choices[0].message.content.trim()
-      : '';
 
     if (!aiMessage) {
       return res.json({ success: false, error: 'AI 服务未返回有效的描述内容，请检查接口配置。' });
@@ -1941,7 +2101,9 @@ app.post('/api/ai/generate-commit', async (req, res) => {
     res.json({ success: true, commitMessage: cleanMessage });
   } catch (err) {
     let errMsg = `AI 服务请求异常: ${err.message}`;
-    if (err.message && err.message.includes('fetch failed')) {
+    if (err && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      errMsg = `AI 服务连续两次请求均超过 ${AI_REQUEST_TIMEOUT_MS / 1000} 秒，已自动停止。请稍后重试或检查模型服务负载。`;
+    } else if (err.message && err.message.includes('fetch failed')) {
       if (aiUrl.includes('localhost') || aiUrl.includes('127.0.0.1')) {
         errMsg = `AI 服务请求异常 (fetch failed): 无法连接到本地 AI 服务。请确保您的 Ollama 已经在本地启动（默认端口 11434），或者在右上角「设置」中配置您使用的云端 AI 服务（例如 DeepSeek、SiliconFlow 等）的 API 地址、API Key 和模型名称。`;
       } else {
