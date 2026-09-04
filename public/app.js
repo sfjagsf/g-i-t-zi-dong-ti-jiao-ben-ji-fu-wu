@@ -780,9 +780,12 @@ async function bindLocalDirectoryToBranch(repo, branchName) {
     });
 
     if (res.success) {
-      const bindMessage = res.pendingPush
+      let bindMessage = res.pendingPush
         ? `已关联到 [${repo.fullName}] 的本地 [${branchName}] 分支，尚未上传代码。请确认改动后点击“提交并推送”。`
         : `成功关联绑定到 [${repo.fullName}] 的 [${branchName}] 分支`;
+      if (res.localBackupBranch) {
+        bindMessage += ` 原同名本地分支已备份为 [${res.localBackupBranch}]。`;
+      }
       addSystemLog(bindMessage);
       delete repoBranchesCache[repo.fullName]; // Clear branch cache to refresh status
       await loadProjectPath(dirPath);
@@ -1190,11 +1193,29 @@ btnAiCommit.addEventListener('click', async () => {
   aiBtnSpinner.classList.remove('hidden');
 
   try {
-    const result = await apiPost(
+    let result = await apiPost(
       '/api/ai/generate-commit',
       { dirPath },
       { timeoutMs: AI_GENERATION_API_TIMEOUT_MS }
     );
+
+    if (result.requiresExternalAiConfirmation) {
+      const confirmed = await showCustomDialog({
+        title: '确认发送 AI 改动摘要',
+        message: `将向外部 AI 服务 [${result.externalAiHost}] 发送非敏感文件的改动摘要以生成提交说明。敏感文件的名称和内容会被过滤。是否继续？`,
+        confirmText: '确认并发送',
+        cancelText: '取消'
+      });
+      if (!confirmed) {
+        addSystemLog('已取消向外部 AI 服务发送改动摘要。');
+        return;
+      }
+      result = await apiPost(
+        '/api/ai/generate-commit',
+        { dirPath, confirmExternalAi: true },
+        { timeoutMs: AI_GENERATION_API_TIMEOUT_MS }
+      );
+    }
 
     if (result.success) {
       if (pathInput.value.trim() !== dirPath) {
@@ -1514,7 +1535,9 @@ async function createBranchFromHash(hash) {
   });
   
   if (res.success) {
-    addSystemLog(`新分支 [${cleanName}] 创建并推送成功，已自动切换至新分支。${getBuildOutputLogText(res.ignoredBuildOutputs)}`);
+    addSystemLog(res.pendingPush
+      ? `新分支 [${cleanName}] 已创建。仓库尚无提交，待首次“提交并推送”后才会上传。`
+      : `新分支 [${cleanName}] 创建并推送成功，已自动切换至新分支。`);
     selectedCommitHash = '';
     
     loadProjectPath(dirPath);
@@ -1539,7 +1562,9 @@ async function performBranchCreation(cleanName) {
     expectedRepoFullName: getExpectedRepoFullName()
   });
   if (res.success) {
-    addSystemLog(`新分支 [${cleanName}] 创建并同步远程成功，已自动切换至新分支。${getBuildOutputLogText(res.ignoredBuildOutputs)}`);
+    addSystemLog(res.pendingPush
+      ? `新分支 [${cleanName}] 已创建。仓库尚无提交，待首次“提交并推送”后才会上传。`
+      : `新分支 [${cleanName}] 创建并同步远程成功，已自动切换至新分支。`);
     
     loadProjectPath(dirPath);
     if (activeSelectedRepo) {

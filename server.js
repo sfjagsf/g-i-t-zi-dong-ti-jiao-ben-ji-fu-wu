@@ -33,6 +33,44 @@ let gitCommandLogSeq = 0;
 let gitCommandRunSeq = 0;
 const remoteHistoryFetches = new Map();
 const activeRepositoryMutations = new Map();
+const REPOSITORY_MUTATION_ROUTES = new Set([
+  '/api/repo/init',
+  '/api/repo/commit',
+  '/api/repo/switch',
+  '/api/repo/create-branch',
+  '/api/repo/delete-branch',
+  '/api/repo/reset',
+  '/api/repo/bind'
+]);
+
+// Git serializes index and ref updates per repository. Keep that serialization
+// visible at the API boundary so concurrent UI clicks cannot race each other.
+app.use((req, res, next) => {
+  if (req.method !== 'POST' || !REPOSITORY_MUTATION_ROUTES.has(req.path)) return next();
+  const safeDir = resolveExistingDirectory(req.body && req.body.dirPath);
+  if (!safeDir) return next();
+
+  const key = repositoryOperationKey(safeDir);
+  const existing = activeRepositoryMutations.get(key);
+  if (existing) {
+    return res.status(409).json({
+      success: false,
+      busy: true,
+      operation: existing.operation,
+      error: `仓库正在执行 ${existing.operation} 操作，请等待完成后再继续。`
+    });
+  }
+
+  const marker = { operation: req.path.replace('/api/repo/', ''), startedAt: Date.now() };
+  activeRepositoryMutations.set(key, marker);
+  req.repositoryMutation = { key, marker };
+  res.once('finish', () => {
+    if (activeRepositoryMutations.get(key) === marker) {
+      activeRepositoryMutations.delete(key);
+    }
+  });
+  next();
+});
 
 function readJsonFile(filePath) {
   if (fs.existsSync(filePath)) {
@@ -549,6 +587,8 @@ function shouldIgnoreFileForAi(filePath) {
   const normalized = filePath.replace(/\\/g, '/').toLowerCase();
   const filename = normalized.split('/').pop();
 
+  if (isSensitiveFileForAi(filePath)) return true;
+
   // 1. Lock files
   const lockFiles = [
     'package-lock.json',
@@ -590,6 +630,23 @@ function shouldIgnoreFileForAi(filePath) {
   if (ignoredExts.some(ext => filename.endsWith(ext))) return true;
 
   return false;
+}
+
+function isSensitiveFileForAi(filePath) {
+  if (!filePath || typeof filePath !== 'string') return true;
+  const normalized = filePath.replace(/\\/g, '/').toLowerCase();
+  const filename = normalized.split('/').pop() || '';
+  const sensitiveNames = [
+    'config.local.json', 'credentials.json', 'credential.json', 'secrets.json',
+    'secret.json', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519'
+  ];
+  const sensitiveExtensions = ['.pem', '.key', '.p12', '.pfx', '.crt', '.cer', '.der', '.jks', '.kdb'];
+  const sensitiveDirectory = /(^|\/)(?:\.ssh|\.aws|\.gnupg|private|secrets?)(?:\/|$)/.test(normalized);
+  const environmentFile = filename === '.env' || filename.startsWith('.env.');
+  const credentialLikeName = /(?:^|[._-])(api[_-]?key|token|password|passwd|secret|credential)(?:[._-]|$)/.test(filename);
+
+  return sensitiveDirectory || environmentFile || sensitiveNames.includes(filename) ||
+    sensitiveExtensions.some(ext => filename.endsWith(ext)) || credentialLikeName;
 }
 
 /**
@@ -643,10 +700,13 @@ async function getCondensedDiffForAi(cwd, token = '', maxTotalChars = 4000) {
   // Build Summary Header
   const summaryLines = ['【文件变更清单概览】'];
   for (const item of statusItems.slice(0, MAX_AI_STATUS_ITEMS)) {
+    const isSensitive = isSensitiveFileForAi(item.path);
     const isIgnored = shouldIgnoreFileForAi(item.path);
-    const tag = isIgnored ? ' (依赖/大文件/构建产物，已自动忽略增删细节)' : '';
+    const tag = isSensitive
+      ? ' (敏感文件，名称和内容均未发送)'
+      : (isIgnored ? ' (依赖/大文件/构建产物，已自动忽略增删细节)' : '');
     const displayStatus = (item.status || '  ').trim() || 'modified';
-    summaryLines.push(`- [${displayStatus}] ${item.path}${tag}`);
+    summaryLines.push(`- [${displayStatus}] ${isSensitive ? '[已隐藏敏感文件]' : item.path}${tag}`);
   }
   if (statusItems.length > MAX_AI_STATUS_ITEMS) {
     summaryLines.push(`- ... 另有 ${statusItems.length - MAX_AI_STATUS_ITEMS} 个文件未展开`);
@@ -981,6 +1041,17 @@ function normalizeChatCompletionsUrl(rawUrl) {
     return `${trimmed}/chat/completions`;
   }
   return `${trimmed}/v1/chat/completions`;
+}
+
+function getExternalAiHost(aiUrl) {
+  try {
+    const hostname = new URL(aiUrl).hostname.toLowerCase();
+    return hostname && hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1'
+      ? hostname
+      : '';
+  } catch (err) {
+    return '';
+  }
 }
 
 function delay(ms) {
@@ -1421,15 +1492,17 @@ app.post('/api/repo/commit', async (req, res) => {
   }
   const { safeDir } = repoCheck;
   const operationKey = repositoryOperationKey(safeDir);
-  if (activeRepositoryMutations.has(operationKey)) {
+  const requestMutation = req.repositoryMutation;
+  if (!requestMutation && activeRepositoryMutations.has(operationKey)) {
     return res.status(409).json({
       success: false,
       busy: true,
       error: '该仓库已有提交推送任务正在执行，请勿重复提交。'
     });
   }
-  const operationMarker = { operation: 'commit', startedAt: Date.now() };
-  activeRepositoryMutations.set(operationKey, operationMarker);
+  const operationMarker = requestMutation?.marker || { operation: 'commit', startedAt: Date.now() };
+  const ownsOperationLock = !requestMutation;
+  if (ownsOperationLock) activeRepositoryMutations.set(operationKey, operationMarker);
 
   try {
   if (!branch) {
@@ -1497,7 +1570,7 @@ app.post('/api/repo/commit', async (req, res) => {
     totalDurationMs: Date.now() - operationStartedAt
   });
   } finally {
-    if (activeRepositoryMutations.get(operationKey) === operationMarker) {
+    if (ownsOperationLock && activeRepositoryMutations.get(operationKey) === operationMarker) {
       activeRepositoryMutations.delete(operationKey);
     }
   }
@@ -1614,24 +1687,19 @@ app.post('/api/repo/create-branch', async (req, res) => {
     }
   }
 
-  const buildOutputResult = await prepareStm32BuildOutputsForCommit(safeDir, token);
-  if (!buildOutputResult.success) {
-    return res.json({ success: false, error: buildOutputResult.error });
+  // Creating a branch must never stage, commit, or alter unrelated working-tree
+  // changes. A first commit remains an explicit user action through /commit.
+  if (!hasCommits) {
+    return res.json({ success: true, pendingPush: true });
   }
 
-  // 2. Stage all modifications
-  await runCommand(safeDir, ['add', '-A'], token);
-
-  // 3. Commit staged changes (allowing empty commit so it never errors)
-  await runCommand(safeDir, ['commit', '--allow-empty', '-m', `Initial commit on branch ${newBranchName}`], token);
-
-  // 4. Push branch to remote
+  // Push only the branch reference and its existing commits.
   const pushRes = await runCommand(safeDir, ['push', '-u', 'origin', newBranchName], token);
   if (!pushRes.success) {
     return res.json({ success: false, error: 'Failed to push branch to remote: ' + pushRes.error });
   }
 
-  res.json({ success: true, ignoredBuildOutputs: buildOutputResult });
+  res.json({ success: true });
 });
 
 // Delete remote branch
@@ -1926,6 +1994,22 @@ app.post('/api/repo/bind', async (req, res) => {
 
   const isRepo = await isGitRepository(safeDir, token);
 
+  // Never replace a working tree while binding it to another remote. The
+  // browser warning is helpful, but this server-side guard is authoritative.
+  if (isRepo) {
+    const statusRes = await runCommand(safeDir, ['status', '--porcelain'], token, { logOutput: false });
+    if (!statusRes.success) {
+      return res.json({ success: false, error: '读取本地改动失败，已取消绑定以保护工作区。' });
+    }
+    if (statusRes.stdout) {
+      return res.status(409).json({
+        success: false,
+        hasChanges: true,
+        error: '本地存在未提交改动。请先提交、暂存或手动备份后再绑定远程仓库。'
+      });
+    }
+  }
+
   // 1. If not a repo, init it
   if (!isRepo) {
     const initRes = await runCommand(safeDir, ['init'], token);
@@ -1940,8 +2024,22 @@ app.post('/api/repo/bind', async (req, res) => {
 
   // 2. Set/update remote URL
   const checkRemote = await runCommand(safeDir, ['remote'], token);
+  const hadOrigin = remoteListHasOrigin(checkRemote.stdout);
+  const originalRemoteRes = hadOrigin
+    ? await runCommand(safeDir, ['remote', 'get-url', 'origin'], token, { logOutput: false })
+    : null;
+  if (hadOrigin && !originalRemoteRes.success) {
+    return res.json({ success: false, error: '读取原 origin 地址失败，已取消重新绑定以防误改远程。' });
+  }
+  const restoreOriginalRemote = async () => {
+    if (hadOrigin) {
+      await runCommand(safeDir, ['remote', 'set-url', 'origin', originalRemoteRes.stdout], token, { logOutput: false });
+    } else {
+      await runCommand(safeDir, ['remote', 'remove', 'origin'], token, { logOutput: false });
+    }
+  };
   let setRemoteRes;
-  if (remoteListHasOrigin(checkRemote.stdout)) {
+  if (hadOrigin) {
     setRemoteRes = await runCommand(safeDir, ['remote', 'set-url', 'origin', cleanRemoteUrl], token);
   } else {
     setRemoteRes = await runCommand(safeDir, ['remote', 'add', 'origin', cleanRemoteUrl], token);
@@ -1960,12 +2058,30 @@ app.post('/api/repo/bind', async (req, res) => {
 
   // 4. Try checking out the target branch
   if (fetchRes.success && await remoteBranchExists(safeDir, branch, token)) {
-    // Branch exists remotely. Checkout to it without resetting an existing local branch.
-    const checkoutRes = await checkoutBranchPreservingLocal(safeDir, branch, token);
+    // Binding means the selected remote branch is the source of truth. Preserve
+    // any same-named local branch under a recovery name before aligning it.
+    let localBackupBranch = '';
+    const localBranchRes = await runCommand(safeDir, ['rev-parse', '--verify', `refs/heads/${branch}`], token, { logOutput: false });
+    if (localBranchRes.success) {
+      const remoteHeadRes = await runCommand(safeDir, ['rev-parse', `origin/${branch}`], token, { logOutput: false });
+      if (remoteHeadRes.success && localBranchRes.stdout !== remoteHeadRes.stdout) {
+        localBackupBranch = `gflow-backup/${Date.now()}-${branch}`;
+        const backupRes = await runCommand(safeDir, ['branch', localBackupBranch, branch], token);
+        if (!backupRes.success) {
+          await restoreOriginalRemote();
+          return res.json({ success: false, error: '备份原本地分支失败，已取消覆盖性绑定: ' + backupRes.error });
+        }
+      }
+    }
+
+    const checkoutRes = await runCommand(safeDir, ['checkout', '-B', branch, `origin/${branch}`], token);
     if (!checkoutRes.success) {
+      await restoreOriginalRemote();
       return res.json({ success: false, error: '切换分支失败: ' + checkoutRes.error });
     }
+    return res.json({ success: true, localBackupBranch });
   } else if (!fetchRes.success && !fetchRes.error.includes('couldn\'t find remote ref')) {
+    await restoreOriginalRemote();
     return res.json({ success: false, error: '拉取远程分支失败: ' + fetchRes.error });
   } else {
     // Branch does not exist remotely. Create or switch to the local branch only.
@@ -2044,7 +2160,7 @@ app.post('/api/repo/diff', async (req, res) => {
 
 // Generate AI commit message from git diff
 app.post('/api/ai/generate-commit', async (req, res) => {
-  const { dirPath } = req.body;
+  const { dirPath, confirmExternalAi = false } = req.body;
   const config = loadConfig();
   const token = config.githubToken || '';
   const repoCheck = await resolveOwnGitRepository(dirPath, token);
@@ -2053,6 +2169,15 @@ app.post('/api/ai/generate-commit', async (req, res) => {
   }
   const { safeDir } = repoCheck;
   const aiUrl = normalizeChatCompletionsUrl(config.aiApiUrl);
+  const externalAiHost = getExternalAiHost(aiUrl);
+  if (externalAiHost && confirmExternalAi !== true) {
+    return res.json({
+      success: false,
+      requiresExternalAiConfirmation: true,
+      externalAiHost,
+      error: `将向外部 AI 服务 ${externalAiHost} 发送已脱敏的代码改动摘要。请确认后继续。`
+    });
+  }
 
   const aiKey = config.aiApiKey || '';
   const aiModel = config.aiModelName || 'deepseek-chat';
