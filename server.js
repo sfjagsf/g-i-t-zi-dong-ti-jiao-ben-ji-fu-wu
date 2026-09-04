@@ -20,8 +20,12 @@ const PROTECTED_PROJECT_PATH_ERROR = '已阻止操作工具自身目录。请链
 // Memory logs of executed git commands
 const MAX_GIT_COMMAND_LOGS = 500;
 const MAX_GIT_LOG_ENTRY_CHARS = 32 * 1024;
-const GITHUB_API_TIMEOUT_MS = 15000;
-const REMOTE_HISTORY_FETCH_TTL_MS = 30000;
+const GITHUB_API_TIMEOUT_MS = 8000;
+// History is read from the already-fetched origin/<branch> ref on a normal
+// page reload. Refreshing that ref more often adds several seconds to startup
+// on large repositories without helping most users.
+const REMOTE_HISTORY_FETCH_TTL_MS = 5 * 60 * 1000;
+const GITHUB_REPO_LIST_CACHE_TTL_MS = 2 * 60 * 1000;
 const AI_REQUEST_TIMEOUT_MS = 60000;
 const AI_REQUEST_MAX_ATTEMPTS = 2;
 const AI_EMPTY_RESPONSE_MAX_ATTEMPTS = 2;
@@ -33,6 +37,7 @@ let gitCommandLogSeq = 0;
 let gitCommandRunSeq = 0;
 const remoteHistoryFetches = new Map();
 const activeRepositoryMutations = new Map();
+let githubRepoListCache = { token: '', repos: [], updatedAt: 0 };
 const REPOSITORY_MUTATION_ROUTES = new Set([
   '/api/repo/init',
   '/api/repo/commit',
@@ -944,9 +949,14 @@ async function callGithubApi(method, apiPath, body, token) {
       return { success: false, statusCode: res.status, error: jsonRes.message || 'GitHub API 发生错误' };
     }
   } catch (err) {
-    const error = err && (err.name === 'TimeoutError' || err.name === 'AbortError')
-      ? `GitHub API 请求超过 ${GITHUB_API_TIMEOUT_MS / 1000} 秒，已取消`
-      : err.message;
+    let error;
+    if (err && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      error = `GitHub API 请求超过 ${GITHUB_API_TIMEOUT_MS / 1000} 秒，已取消`;
+    } else if (err && err.message && err.message.includes('fetch failed')) {
+      error = '无法连接 GitHub API（fetch failed）。请检查网络、代理或 VPN；本地 Git 远程可用不代表 Node.js API 请求已走同一代理。';
+    } else {
+      error = err && err.message ? err.message : 'GitHub API 请求失败';
+    }
     return { success: false, error };
   }
 }
@@ -1821,16 +1831,18 @@ app.get('/api/github/repos', async (req, res) => {
     return res.json({ success: false, error: 'GitHub 账号未登录，请先在右上角配置 Token' });
   }
 
-  const loginResult = await getAuthenticatedGithubLogin(token);
-  if (!loginResult.success) {
-    return res.status(loginResult.statusCode || 400).json({ success: false, error: loginResult.error });
+  const cached = githubRepoListCache;
+  if (cached.token === token && cached.repos.length > 0 && Date.now() - cached.updatedAt < GITHUB_REPO_LIST_CACHE_TTL_MS) {
+    return res.json({ success: true, repos: cached.repos, cached: true });
   }
 
-  // Fetch up to 100 repositories, sorted by last updated
-  const apiRes = await callGithubApi('GET', '/user/repos?sort=updated&per_page=100', null, token);
+  // `affiliation=owner` avoids a separate /user request. That removes one
+  // network round trip on every page load while write endpoints still verify
+  // the token owner immediately before any remote mutation.
+  const apiRes = await callGithubApi('GET', '/user/repos?affiliation=owner&sort=updated&per_page=100', null, token);
   if (apiRes.success) {
     const repos = apiRes.data
-      .filter(repo => repo.owner && repo.owner.login && repo.owner.login.toLowerCase() === loginResult.login.toLowerCase())
+      .filter(repo => repo && repo.owner && repo.owner.login)
       .map(repo => ({
         name: repo.name,
         fullName: repo.full_name,
@@ -1840,8 +1852,12 @@ app.get('/api/github/repos', async (req, res) => {
         defaultBranch: repo.default_branch,
         description: repo.description // Return description
       }));
+    githubRepoListCache = { token, repos, updatedAt: Date.now() };
     res.json({ success: true, repos });
   } else {
+    if (cached.token === token && cached.repos.length > 0) {
+      return res.json({ success: true, repos: cached.repos, cached: true, stale: true });
+    }
     res.json({ success: false, error: apiRes.error });
   }
 });
