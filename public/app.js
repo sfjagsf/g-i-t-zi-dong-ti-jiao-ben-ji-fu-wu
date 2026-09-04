@@ -451,10 +451,18 @@ async function fetchGithubRepos() {
   
   const res = await apiGet('/api/github/repos');
   if (res.success) {
-    globalReposList = res.repos;
-    populateRepoDropdown(res.repos);
+    const localOnlyRepos = globalReposList.filter(repo => repo.localOnly);
+    const remoteRepoNames = new Set(res.repos.map(repo => repo.fullName.toLowerCase()));
+    globalReposList = [...res.repos, ...localOnlyRepos.filter(repo => !remoteRepoNames.has(repo.fullName.toLowerCase()))];
+    populateRepoDropdown(globalReposList);
   } else {
-    setSelectMessage(repoSelect, `加载仓库失败: ${res.error}`);
+    // Local Git state remains useful when Node.js cannot reach GitHub's API.
+    if (globalReposList.length > 0) {
+      populateRepoDropdown(globalReposList);
+      addSystemLog(`GitHub 仓库列表暂不可用，已保留本地 Git 识别到的仓库: ${res.error}`);
+    } else {
+      setSelectMessage(repoSelect, `加载仓库失败: ${res.error}`);
+    }
   }
 }
 
@@ -487,7 +495,7 @@ function syncDropdownWithRemote(remoteUrl) {
   if (match) {
     repoSelect.value = match.fullName;
     activeSelectedRepo = match;
-    btnDeleteActiveRepo.classList.remove('hidden');
+    btnDeleteActiveRepo.classList.toggle('hidden', !!match.localOnly);
     loadBranchesForSelectedRepo(match);
   } else {
     btnDeleteActiveRepo.classList.add('hidden');
@@ -507,7 +515,7 @@ repoSelect.addEventListener('change', async () => {
   const match = globalReposList.find(repo => repo.fullName === selectedFullName);
   if (match) {
     activeSelectedRepo = match;
-    btnDeleteActiveRepo.classList.remove('hidden');
+    btnDeleteActiveRepo.classList.toggle('hidden', !!match.localOnly);
     loadBranchesForSelectedRepo(match);
 
     // If local path is set, check if we need to auto-init or re-associate remote origin
@@ -544,6 +552,14 @@ repoSelect.addEventListener('change', async () => {
   }
 });
 
+async function loadLocalRepositoryBranches(repo) {
+  const dirPath = pathInput.value.trim();
+  if (!dirPath || !isMatchingRemote(currentRepoStatus.remoteUrl, repo.fullName)) {
+    return { success: false, error: '当前目录未连接到该仓库。' };
+  }
+  return apiPost('/api/repo/branches', { dirPath });
+}
+
 // Load and populate branches for selected repository
 async function loadBranchesForSelectedRepo(repo) {
   branchesListContainer.innerHTML = '<div class="loading-spinner">正在获取分支...</div>';
@@ -563,7 +579,14 @@ async function loadBranchesForSelectedRepo(repo) {
     if (branches !== null) {
       populateBranchesUI(repo, ['main']);
     } else {
-      setTextState(branchesListContainer, `加载分支失败: ${res.error}`, 'text-warning');
+      const localRes = await loadLocalRepositoryBranches(repo);
+      if (localRes.success) {
+        repoBranchesCache[repo.fullName] = localRes.branches;
+        populateBranchesUI(repo, localRes.branches);
+        addSystemLog('GitHub API 分支列表不可用，已显示本地 Git 已同步的远程分支。');
+      } else {
+        setTextState(branchesListContainer, `加载分支失败: ${res.error}`, 'text-warning');
+      }
     }
   }
 }
@@ -597,7 +620,7 @@ function populateBranchesUI(repo, branches) {
     item.appendChild(nameWrap);
 
     // Delete branch icon (except if it is active or default)
-    if (!isActive && branch !== repo.defaultBranch) {
+    if (!repo.localOnly && !isActive && branch !== repo.defaultBranch) {
       const btnDelBranch = document.createElement('button');
       btnDelBranch.className = 'btn-delete-branch';
       btnDelBranch.innerHTML = '<i data-lucide="trash-2" class="icon-xs"></i>';
@@ -650,6 +673,30 @@ function populateBranchesUI(repo, branches) {
   refreshIcons();
 }
 
+function ensureLocalRemoteRepository(remoteUrl, currentBranch) {
+  if (typeof remoteUrl !== 'string') return null;
+  const cleanUrl = remoteUrl.trim().replace(/\/$/, '').replace(/\.git$/i, '');
+  const match = cleanUrl.match(/^(?:https?:\/\/)?(?:[^@/\s]+@)?github\.com(?::|\/)([^/\s]+)\/([^/\s]+)$/i);
+  if (!match) return null;
+
+  const [, owner, name] = match;
+  const fullName = `${owner}/${name}`;
+  const existing = globalReposList.find(repo => repo.fullName.toLowerCase() === fullName.toLowerCase());
+  if (existing) return existing;
+
+  const localRepo = {
+    name,
+    fullName,
+    owner,
+    htmlUrl: `https://github.com/${fullName}`,
+    defaultBranch: currentBranch || 'main',
+    description: `${name}（本地已连接）`,
+    localOnly: true
+  };
+  globalReposList = [localRepo, ...globalReposList];
+  return localRepo;
+}
+
 // Match remote URL
 function isMatchingRemote(url, fullName) {
   if (!url) return false;
@@ -672,8 +719,15 @@ async function getRemoteBranchesForBinding(repo) {
     return repoBranchesCache[repo.fullName];
   }
 
-  const res = await apiPost('/api/github/repos/branches', { owner: repo.owner, repo: repo.name });
-  if (!res.success) return [];
+  const res = repo.localOnly
+    ? await loadLocalRepositoryBranches(repo)
+    : await apiPost('/api/github/repos/branches', { owner: repo.owner, repo: repo.name });
+  if (!res.success) {
+    const localRes = await loadLocalRepositoryBranches(repo);
+    if (!localRes.success) return [];
+    repoBranchesCache[repo.fullName] = localRes.branches;
+    return localRes.branches;
+  }
 
   repoBranchesCache[repo.fullName] = res.branches;
   return res.branches;
@@ -821,15 +875,19 @@ function updateLocalRepoUi(statusRes, absolutePath, { refreshBranches = true, re
     ribbonBranch.innerText = statusRes.currentBranch || 'DETACHED';
     selectedBranch = statusRes.currentBranch || '';
 
-    if (globalReposList.length > 0 && statusRes.remoteUrl) {
-      const match = globalReposList.find(repo => isMatchingRemote(statusRes.remoteUrl, repo.fullName));
+    if (statusRes.remoteUrl) {
+      const knownMatch = globalReposList.find(repo => isMatchingRemote(statusRes.remoteUrl, repo.fullName));
+      const match = knownMatch || ensureLocalRemoteRepository(statusRes.remoteUrl, statusRes.currentBranch);
       if (match) {
+        // Adding a local fallback repopulates and synchronizes the dropdown,
+        // which already starts one branch load through syncDropdownWithRemote.
+        if (!knownMatch) populateRepoDropdown(globalReposList);
         repoSelect.value = match.fullName;
         activeSelectedRepo = match;
-        btnDeleteActiveRepo.classList.remove('hidden');
+        btnDeleteActiveRepo.classList.toggle('hidden', !!match.localOnly);
         ribbonRepo.innerText = match.description || match.name;
 
-        if (refreshBranches) {
+        if (refreshBranches && knownMatch) {
           loadBranchesForSelectedRepo(match);
         }
       } else {
@@ -930,10 +988,16 @@ async function loadProjectPath(dirPath, isRetry = false) {
     }
 
     updateLocalRepoUi(statusRes, absolutePath, { refreshHistory: false });
-    const bindingStarted = await offerDefaultBranchBinding(absolutePath);
-    if (!bindingStarted && selectedBranch) {
+    // History is entirely available from local origin/<branch>. Do not hold it
+    // behind an optional remote-branch lookup used only for copied-repo repair.
+    if (selectedBranch) {
       loadCommitHistory();
     }
+    offerDefaultBranchBinding(absolutePath).then(bindingStarted => {
+      if (bindingStarted && requestSeq === repoStatusRequestSeq && selectedBranch) {
+        loadCommitHistory();
+      }
+    });
   } else if (statusRes.busy) {
     addSystemLog(statusRes.error || '仓库正在执行 Git 操作，稍后自动重试。');
     window.setTimeout(() => {
