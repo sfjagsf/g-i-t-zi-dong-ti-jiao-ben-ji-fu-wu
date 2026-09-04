@@ -1374,3 +1374,184 @@ body {
     max-width: 120px;
   }
 }
+
+/* --------------------------------------------------------------------------
+   Refined workspace theme: calmer contrast, clearer hierarchy, less visual
+   noise. These rules intentionally sit last so existing component states keep
+   working while the application gains a more desktop-native finish.
+   -------------------------------------------------------------------------- */
+:root {
+  --bg-color: #080b14;
+  --panel-bg: rgba(15, 20, 34, 0.9);
+  --panel-bg-hover: rgba(24, 32, 51, 0.97);
+  --border-color: rgba(148, 163, 184, 0.14);
+  --border-focus: rgba(34, 211, 238, 0.72);
+  --text-main: #eef4ff;
+  --text-muted: #9aa9c3;
+  --text-dark: #64748b;
+  --accent-cyan: #22d3ee;
+  --accent-blue: #60a5fa;
+  --accent-purple: #a78bfa;
+  --accent-pink: #f472b6;
+  --shadow-glow: 0 12px 32px rgba(8, 145, 178, 0.18);
+  --shadow-glow-purple: 0 18px 46px rgba(76, 29, 149, 0.22);
+  --transition-speed: 0.18s;
+}
+
+body {
+  background:
+    radial-gradient(circle at 12% -10%, rgba(34, 211, 238, 0.09), transparent 27%),
+    radial-gradient(circle at 90% 4%, rgba(96, 165, 250, 0.08), transparent 25%),
+    var(--bg-color);
+}
+
+.glow-1 { background: radial-gradient(circle, rgba(34, 211, 238, 0.1), transparent 70%); }
+.glow-2 { background: radial-gradient(circle, rgba(96, 165, 250, 0.08), transparent 70%); }
+
+.glass {
+  border-radius: 14px;
+  background: var(--panel-bg);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.16);
+}
+
+.app-container { padding: 14px; gap: 14px; }
+
+.top-bar {
+  height: 68px;
+  padding: 12px 20px;
+  background: rgba(12, 17, 30, 0.92);
+}
+
+.brand { gap: 10px; min-width: 205px; }
+.brand-text {
+  font-size: 1.05rem;
+  letter-spacing: 1.8px;
+  background: linear-gradient(to right, #ffffff, #b9c7dd);
+  -webkit-background-clip: text;
+}
+.path-selector-container { max-width: 760px; margin: 0 auto; }
+.path-input-wrapper {
+  min-height: 42px;
+  padding: 5px 8px 5px 13px;
+  border-radius: 10px;
+  background: rgba(5, 9, 19, 0.72);
+}
+.path-input-wrapper input { font-size: 0.82rem; }
+.auth-info {
+  border-radius: 10px;
+  background: rgba(30, 41, 59, 0.48);
+  font-size: 0.8rem;
+}
+
+.main-layout {
+  grid-template-columns: minmax(260px, 300px) minmax(460px, 1fr) minmax(280px, 320px);
+  gap: 14px;
+  height: calc(100vh - 286px);
+}
+.panel { transition: border-color var(--transition-speed), box-shadow var(--transition-speed); }
+.panel:hover { border-color: rgba(148, 163, 184, 0.22); }
+.panel-header { min-height: 60px; padding: 14px 16px; }
+.panel-title-group h2 {
+  font-size: 0.9rem;
+  font-weight: 700;
+  letter-spacing: 0.45px;
+  text-transform: none;
+}
+.panel-content { padding: 14px; }
+
+.active-repo-ribbon {
+  padding: 13px 15px;
+  border-radius: 10px;
+  background: linear-gradient(100deg, rgba(8, 47, 73, 0.55), rgba(20, 37, 58, 0.56));
+  border-color: rgba(34, 211, 238, 0.2);
+}
+.ribbon-text { font-size: 0.76rem; }
+.branch-badge {
+  color: var(--accent-cyan) !important;
+  font-weight: 600;
+}
+
+.select-custom,
+.branch-create-inline input,
+.form-group input,
+.form-group textarea {
+  background: rgba(5, 9, 19, 0.66);
+  border-radius: 8px;
+}
+.select-custom { min-height: 40px; }
+.branch-header-row,
+.changes-header-row { margin-bottom: 10px; padding-bottom: 0; border-bottom: 0; }
+.branch-item {
+  padding: 10px 11px;
+  border-radius: 8px;
+  background: rgba(30, 41, 59, 0.22);
+}
+.branch-item.active {
+  background: linear-gradient(90deg, rgba(8, 145, 178, 0.18), rgba(8, 145, 178, 0.04));
+  border-color: rgba(34, 211, 238, 0.3);
+}
+
+.btn { border-radius: 8px; }
+.btn-primary-outline { background: rgba(30, 41, 59, 0.32); }
+.btn-primary-outline:hover { background: rgba(51, 65, 85, 0.64); }
+.btn-secondary { background: rgba(51, 65, 85, 0.5); }
+.btn-accent {
+  color: #06131b;
+  background: linear-gradient(100deg, #22d3ee 0%, #38bdf8 55%, #60a5fa 100%);
+}
+.glow-btn-effect { box-shadow: 0 8px 20px rgba(14, 165, 233, 0.2); }
+.btn-lg { min-height: 46px; }
+
+.file-change-item {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(30, 41, 59, 0.28);
+}
+.count-badge {
+  min-width: 22px;
+  text-align: center;
+  color: #cbd5e1;
+  background: rgba(71, 85, 105, 0.45);
+}
+.commit-form-wrapper {
+  padding: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.13);
+  border-radius: 11px;
+  background: linear-gradient(145deg, rgba(24, 32, 51, 0.72), rgba(11, 16, 29, 0.72));
+}
+.info-alert {
+  border-radius: 8px;
+  background: rgba(30, 41, 59, 0.32);
+  border-color: rgba(148, 163, 184, 0.1);
+}
+
+.history-item {
+  padding: 10px 11px;
+  border-radius: 8px;
+  background: rgba(30, 41, 59, 0.15);
+}
+.history-item.selected {
+  background: rgba(30, 41, 59, 0.62);
+  border-color: rgba(96, 165, 250, 0.24);
+}
+.history-item:hover { background: rgba(51, 65, 85, 0.38); }
+
+.console-panel { height: 178px; }
+.console-header {
+  min-height: 40px;
+  padding: 8px 14px;
+  background: rgba(5, 9, 19, 0.4);
+}
+.console-output { background: rgba(3, 7, 16, 0.48); }
+
+@media (max-width: 1200px) {
+  .main-layout { grid-template-columns: 250px minmax(420px, 1fr) 270px; }
+  .brand { min-width: auto; }
+}
+
+@media (max-width: 1024px) {
+  .main-layout { grid-template-columns: 1fr !important; height: auto; }
+  .console-panel { min-height: 178px; }
+}
